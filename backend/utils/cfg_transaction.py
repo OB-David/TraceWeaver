@@ -249,6 +249,12 @@ class CFGConstructor:
             erc20_table_items = [
                 item for item in table_items
                 if item.get("op") in {"SLOAD", "SSTORE"}
+                and item.get("event_kind") != "approvement"
+            ]
+            approvement_table_items = [
+                item for item in table_items
+                if item.get("op") in {"SLOAD", "SSTORE"}
+                and item.get("event_kind") == "approvement"
             ]
 
             # 处理 ERC20 读写
@@ -274,6 +280,33 @@ class CFGConstructor:
                         )
                     except Exception:
                         pass
+
+            # allowance 是独立于余额的嵌套映射。保留相同的 ERC20
+            # action 外形，但使用显式类型，避免在 BasicBlock 中被误读为余额事件。
+            for item in approvement_table_items:
+                is_read = item.get("op") == "SLOAD"
+                action_type = "read approvement" if is_read else "write approvement"
+                token_address = item.get("token_address", "")
+                approvement_event = {
+                    "tokenname": item.get("token_name", ""),
+                    "token_address": token_address,
+                    "decimals": self._get_token_decimals(token_address),
+                    "type": action_type,
+                    "owner": item.get("owner_address", ""),
+                    "spender": item.get("spender_address", ""),
+                    "allowance_slot": item.get("allowance_slot", ""),
+                    "allowance": self._normalize_hex_value(item.get("balance/amount", "")),
+                }
+                try:
+                    node.add_action(
+                        action_type=action_type,
+                        erc20_events=[],
+                        approvement_events=[approvement_event],
+                        send_eth="NO",
+                        eth_event=None,
+                    )
+                except Exception:
+                    pass
 
             # 处理 ETH 转账
             if eth_table_items:
@@ -1209,6 +1242,7 @@ class CFGConstructor:
         trace: Dict[str, Any],
         slot_map: Dict[str, str],
         erc20_token_map: Dict[str, str],
+        allowance_slot_map: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Tuple[CFG, CFG, List[Dict[str, Any]], Dict[str, List[str]], List[Dict[str, Any]]]:
         """构建CFG（核心入口）"""
         cfg = CFG(tx_hash=trace["tx_hash"])
@@ -1234,6 +1268,10 @@ class CFGConstructor:
 
         all_changes = []  # 存储所有余额变化事件
         balance_traces = defaultdict(lambda: {"SLOAD": None, "SLOAD_pc": None, "SSTORE": None, "SSTORE_pc": None})
+        allowance_slot_map = {
+            str(slot).lower(): metadata
+            for slot, metadata in (allowance_slot_map or {}).items()
+        }
 
         # 遍历trace构建结构 + 维护table
         while current_step_idx < len(steps):
@@ -1315,6 +1353,28 @@ class CFGConstructor:
                         balance_traces[(current_address, from_addr)]["SLOAD_pc"] = current_pc
                         balance_traces[(current_address, from_addr)]["SLOAD_step"] = current_step_idx
 
+                allowance_metadata = allowance_slot_map.get(slot_hex)
+                if allowance_metadata:
+                    token_name = self._get_token_name_by_address(RW_address, erc20_token_map)
+                    if token_name:
+                        allowance_hex = "0x0"
+                        if current_step_idx + 1 < len(steps):
+                            next_stack = steps[current_step_idx + 1].get("stack", [])
+                            allowance_hex = next_stack[-1] if next_stack else "0x0"
+                        self.table.append({
+                            "pc": current_pc,
+                            "codecontract_address": current_address,
+                            "step": current_step_idx,
+                            "op": "SLOAD",
+                            "event_kind": "approvement",
+                            "owner_address": allowance_metadata.get("owner_address", ""),
+                            "spender_address": allowance_metadata.get("spender_address", ""),
+                            "allowance_slot": slot_hex,
+                            "token_name": token_name,
+                            "token_address": RW_address,
+                            "balance/amount": self._normalize_hex_value(allowance_hex),
+                        })
+
 
             # 处理SSTORE
             if current_opcode == "SSTORE" and len(current_stack) >= 2:
@@ -1351,6 +1411,24 @@ class CFGConstructor:
                                 })
                             balance_traces[(current_address, to_addr)]["SLOAD"] = None
                             balance_traces[(current_address, to_addr)]["SSTORE"] = None
+
+                allowance_metadata = allowance_slot_map.get(slot_hex)
+                if allowance_metadata:
+                    token_name = self._get_token_name_by_address(RW_address, erc20_token_map)
+                    if token_name:
+                        self.table.append({
+                            "pc": current_pc,
+                            "codecontract_address": current_address,
+                            "step": current_step_idx,
+                            "op": "SSTORE",
+                            "event_kind": "approvement",
+                            "owner_address": allowance_metadata.get("owner_address", ""),
+                            "spender_address": allowance_metadata.get("spender_address", ""),
+                            "allowance_slot": slot_hex,
+                            "token_name": token_name,
+                            "token_address": RW_address,
+                            "balance/amount": self._normalize_hex_value(balance_hex),
+                        })
 
             # Gas累加
             gas_value = self._get_step_gas_decimal(current_step)

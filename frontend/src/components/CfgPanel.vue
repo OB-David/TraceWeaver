@@ -1749,6 +1749,26 @@ function buildActionDisplays(action: BlockAction, index: number): ActionDisplay[
     }]
   }
 
+  if (action.approvement_events && action.approvement_events.length > 0) {
+    return action.approvement_events.map((ev, i) => {
+      const isRead = ev.type === 'read approvement'
+      const token = ev.tokenname || 'ERC20'
+      const amount = formatTokenAmount(ev.allowance, ev.decimals ?? 18)
+      const suffix = action.approvement_events!.length > 1 ? `.${i + 1}` : ''
+      return {
+        key: `${index}-approvement-${i}`,
+        title: `${prefix}${suffix} · ${isRead ? 'Read approvement' : 'Write approvement'}`,
+        tone: isRead ? 'read' : 'write',
+        details: [
+          { label: 'Token', value: token },
+          { label: 'Owner', value: addrToName(ev.owner || '') },
+          { label: 'Spender', value: addrToName(ev.spender || '') },
+          { label: isRead ? 'Allowance read' : 'Allowance written', value: `${amount} ${token}` },
+        ],
+      }
+    })
+  }
+
   if (action.erc20_events && action.erc20_events.length > 0) {
     return action.erc20_events.map((ev, i) => {
       const isRead = ev.type === 'read'

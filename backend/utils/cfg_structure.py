@@ -22,11 +22,14 @@ class BlockNode:
         self,
         action_type: str,
         erc20_events: Optional[List[Dict[str, Any]]] = None,
+        approvement_events: Optional[List[Dict[str, Any]]] = None,
         send_eth: str = "NO",
         eth_event: Optional[Dict[str, Any]] = None,
     ) -> None:
         if erc20_events is None:
             erc20_events = []
+        if approvement_events is None:
+            approvement_events = []
         if eth_event is None:
             eth_event = {}
         if eth_event and "type" not in eth_event:
@@ -35,6 +38,7 @@ class BlockNode:
         action = {
             "action_type": action_type,
             "erc20_events": erc20_events,
+            "approvement_events": approvement_events,
             "send_eth": "YES" if send_eth == "YES" else "NO",
             "eth_event": eth_event
         }

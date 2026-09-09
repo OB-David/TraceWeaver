@@ -9,7 +9,7 @@ from utils.evm_information import TraceFormatter
 from utils.basic_block import BasicBlockProcessor
 from utils.cfg_transaction import CFGConstructor
 from utils.render_cfg import get_valid_nodes_and_colors, render_transaction
-from utils.extract_token_changes import pair_transactions, render_asset_flow, afg_to_fcfg, afg_to_pcfg, afg_to_call_tree, build_link_artifact, compute_address_balances, build_balance_timeline, filter_asset_flow_user_addresses
+from utils.extract_token_changes import pair_transactions, render_asset_flow, afg_to_fcfg, afg_to_pcfg, afg_to_call_tree, build_link_artifact, compute_address_balances, build_balance_timeline, filter_asset_flow_user_addresses, extract_allowance_changes, build_approval_edges
 from utils.tfg_cycles import detect_tfg_cycles
 from utils.call_tree import build_refined_hierarchical_trace, write_call_tree_json
 from utils.indentify_swap import filter_to_file
@@ -127,6 +127,7 @@ def main():
         # 3. 提取关键映射数据
         contracts_addresses = standardized_trace.get("contracts_addresses", [])
         slot_map = standardized_trace.get("slot_map", {})
+        allowance_slot_map = standardized_trace.get("allowance_slot_map", {})
         users_addresses = standardized_trace.get("users_addresses", [])
         erc20_token_map = standardized_trace.get("erc20_token_map", {})
         full_address_name_map = standardized_trace.get("full_address_name_map", {}) 
@@ -154,7 +155,9 @@ def main():
         # 返回基本块连接的原始original_cfg，折叠后的tx_cfg
         # 查询关联都基于original_cfg
         # original_cfg基于pc，tx_cfg基于original_cfg的blockid
-        plain_cfg, folded_cfg, original_cfg, all_changes, folded_node_map, table = cfg_constructor.construct_cfg(standardized_trace, slot_map, erc20_token_map)
+        plain_cfg, folded_cfg, original_cfg, all_changes, folded_node_map, table = cfg_constructor.construct_cfg(
+            standardized_trace, slot_map, erc20_token_map, allowance_slot_map
+        )
         print(f"成功构建交plain CFG，包含 {len(plain_cfg.nodes)} 个节点和 {len(plain_cfg.edges)} 条边\n")
         print(f"成功构建交folded CFG，包含 {len(folded_cfg.nodes)} 个节点和 {len(folded_cfg.edges)} 条边\n")
 
@@ -165,9 +168,14 @@ def main():
         original_transfer = [from_address.lower(),to_address.lower(), int(amount)]
         print(int(amount))
         pairs, annotations, pending_erc20 = pair_transactions(original_transfer,all_changes, token_decimals_map)
-        edge_link1 = afg_to_fcfg(pairs, pending_erc20, folded_cfg)
-        edge_link2 = afg_to_pcfg(pairs, pending_erc20, plain_cfg)
-        edge_link_call_tree = afg_to_call_tree(pairs, pending_erc20, tree_data)
+        allowance_changes = extract_allowance_changes(
+            standardized_trace["steps"], allowance_slot_map,
+            erc20_token_map, token_decimals_map,
+        )
+        approvals = build_approval_edges(pairs, pending_erc20, allowance_changes)
+        edge_link1 = afg_to_fcfg(pairs, pending_erc20, folded_cfg, approvals)
+        edge_link2 = afg_to_pcfg(pairs, pending_erc20, plain_cfg, approvals)
+        edge_link_call_tree = afg_to_call_tree(pairs, pending_erc20, tree_data, approvals)
         
         print(f"共提取到 {len(all_changes)} 条资产变更事件，配对成功 {len(pairs)} 对交易流,存在孤立变动{len(annotations)}条\n")
         tfg_cycle_result = detect_tfg_cycles(pairs)
@@ -198,6 +206,8 @@ def main():
         with open(changes_path, "w", encoding="utf-8") as f:
             json.dump(all_changes, f, indent=2, ensure_ascii=False)
         print(f"资产变更数据已保存到: {changes_path}")
+        with open(os.path.join(result_dir, "allowance_changes.json"), "w", encoding="utf-8") as f:
+            json.dump(approvals, f, indent=2, ensure_ascii=False)
 
         # 11. 折叠/普通 CFG 关联只保存为一个版本化文件。
         link_path = os.path.join(result_dir, "link.json")
@@ -226,7 +236,7 @@ def main():
 
         # 12. 渲染并保存三个核心图
         save_graphs(result_dir=result_dir, plain_cfg=plain_cfg, folded_cfg = folded_cfg, full_address_name_map = full_address_name_map, erc20_token_map=erc20_token_map, 
-                    users_addresses=users_addresses, pairs=pairs, annotations=annotations, pending_erc20=pending_erc20,
+                    users_addresses=users_addresses, pairs=pairs, annotations=annotations, pending_erc20=pending_erc20, approvals=approvals,
                     tree_data=tree_data)
 
     except Exception as e:
@@ -241,7 +251,7 @@ def create_result_directory(tx_hash: str) -> str:
     result_dir.mkdir(parents=True, exist_ok=True)
     return str(result_dir)
 
-def save_graphs(result_dir: str, plain_cfg: object,folded_cfg:object, full_address_name_map: Dict[str, str], erc20_token_map: Dict[str, Any], users_addresses: List[str], pairs: List[Dict[str, Any]], annotations: List[Dict[str, Any]], pending_erc20: List[Dict[str, Any]], tree_data, progress_callback: Optional[Callable[[str], None]] = None, timing_callback: Optional[Callable[[str, float], None]] = None):
+def save_graphs(result_dir: str, plain_cfg: object,folded_cfg:object, full_address_name_map: Dict[str, str], erc20_token_map: Dict[str, Any], users_addresses: List[str], pairs: List[Dict[str, Any]], annotations: List[Dict[str, Any]], pending_erc20: List[Dict[str, Any]], tree_data, approvals: Optional[List[Dict[str, Any]]] = None, progress_callback: Optional[Callable[[str], None]] = None, timing_callback: Optional[Callable[[str, float], None]] = None):
     '''保存可重建图源；SVG 只按请求渲染，不进入分析目录。'''
 
     # Re-analysis may reuse a result directory created by an older version.
@@ -270,13 +280,14 @@ def save_graphs(result_dir: str, plain_cfg: object,folded_cfg:object, full_addre
     # 保存代币交易流图的DOT文件
     token_flow_dot_path = os.path.join(result_dir, "asset_flow.dot")
     tfg_user_addresses = filter_asset_flow_user_addresses(
-        users_addresses, pairs, pending_erc20
+        users_addresses, pairs, pending_erc20, approvals
     )
     with measure("render_afg_dot"):
         render_asset_flow(pairs, annotations, tfg_user_addresses,
                       full_address_name_map, pending_erc20,
                       addr_color_map, token_flow_dot_path,
-                      erc20_token_map=erc20_token_map)
+                      erc20_token_map=erc20_token_map,
+                      approvals=approvals)
     print(f"代币交易流图DOT文件已保存到: {token_flow_dot_path}.dot")
 
     # TFG 完成后再构建 legend，只保留真实参与 TFG 的用户地址。

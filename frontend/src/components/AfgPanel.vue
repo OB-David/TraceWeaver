@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import {
   fetchAddressBalances,
+  fetchAllowanceChanges,
   fetchBalanceTimeline,
   fetchTfgCycleResult,
   fetchCallTreeEdgeLink,
@@ -10,7 +11,7 @@ import {
   fetchTfgSvg,
   fetchEdgeLink,
   fetchLegendData,
-  fetchTfgPlaybackRelayout,
+  fetchTfgRelayout,
   type AfgNavigationTarget,
   type TfgAtomicAddressCycle,
   type TfgStructuralPath,
@@ -22,7 +23,12 @@ import {
   type BlockInformation,
   type BalanceTimelineEvent,
 } from '../api/analyze'
-import { THEME_DARK_COLORS, getDarkAccentForColor, getFillColorForColor } from '../visualTheme'
+import {
+  THEME_DARK_COLORS,
+  getDarkAccentForColor,
+  getFillColorForColor,
+  getReadableTextOnLight,
+} from '../visualTheme'
 import GraphExpandButton from './GraphExpandButton.vue'
 import GraphFitButton from './GraphFitButton.vue'
 
@@ -68,8 +74,11 @@ const errorMsg = ref('')
 const linksLoading = ref(false)
 const mappingNotice = ref('')
 const fullSvgSource = ref('')
+const approveSvgSource = ref('')
 const relayoutState = ref<RelayoutState>('idle')
 const relayoutError = ref('')
+const showApproveEdges = ref(false)
+const approveEdgeCount = ref(0)
 
 const graphContainer = ref<HTMLElement | null>(null)
 let disposeSvgViewport: (() => void) | null = null
@@ -171,6 +180,9 @@ watch(() => props.txHash, (newHash) => {
   relayoutState.value = 'idle'
   relayoutError.value = ''
   fullSvgSource.value = ''
+  approveSvgSource.value = ''
+  showApproveEdges.value = false
+  approveEdgeCount.value = 0
   disposeSvgViewport?.()
   disposeSvgViewport = null
   resetSvgViewport = null
@@ -249,7 +261,7 @@ async function loadAfgData(txHash: string, cfgMode: CfgMode) {
   tokenAddressToName.value = {}
 
   try {
-    const [svg, links, callLinks, tfgCycles, balances, balanceTimeline, legend] = await Promise.all([
+    const [svg, links, callLinks, tfgCycles, balances, balanceTimeline, legend, allowances] = await Promise.all([
       fetchTfgSvg(txHash),
       fetchEdgeLink(txHash, cfgMode),
       fetchCallTreeEdgeLink(txHash),
@@ -257,6 +269,7 @@ async function loadAfgData(txHash: string, cfgMode: CfgMode) {
       fetchAddressBalances(txHash),
       fetchBalanceTimeline(txHash).catch(() => null),
       fetchLegendData(txHash),
+      fetchAllowanceChanges(txHash),
     ])
     if (requestId !== loadRequestId || props.txHash !== txHash) return
 
@@ -302,6 +315,7 @@ async function loadAfgData(txHash: string, cfgMode: CfgMode) {
       if (entry.address && entry.name) tokenNameMap[entry.address.toLowerCase()] = entry.name
     }
     tokenAddressToName.value = tokenNameMap
+    approveEdgeCount.value = allowances.length
 
     fullSvgSource.value = svg
     await nextTick()
@@ -444,6 +458,10 @@ function attachInteractivity(resetPlaybackTimeline = true) {
   })
 
   const edges = svg.querySelectorAll('.edge')
+  approveEdgeCount.value = Math.max(
+    approveEdgeCount.value,
+    svg.querySelectorAll('.edge.approve-edge').length,
+  )
   edges.forEach((edge) => {
     const edgeEl = edge as SVGElement
     harmonizeEdgeAppearance(edgeEl)
@@ -505,6 +523,7 @@ function attachInteractivity(resetPlaybackTimeline = true) {
   } else {
     applyPlaybackVisibility()
   }
+  applyApproveVisibility()
 }
 
 function getEdgeOrder(edge: Element): number | null {
@@ -672,6 +691,7 @@ function initializePlayback() {
   const orders = [...new Set(
     Array.from(svg.querySelectorAll('.edge'))
       .map(edge => {
+        if (edge.classList.contains('approve-edge')) return null
         const order = getEdgeOrder(edge)
         if (order !== null) (edge as HTMLElement).dataset.playbackOrder = String(order)
         return order
@@ -801,21 +821,41 @@ function stopPlayback() {
 function applyPlaybackVisibility() {
   const svg = graphContainer.value?.querySelector('svg')
   const currentOrder = currentPlaybackStep.value?.visibleTransferOrder
+  const cutoffStep = currentPlaybackStep.value?.cutoffStep
   if (!svg || currentOrder === undefined) return
 
   const visibleNodeTitles = new Set<string>()
   svg.querySelectorAll('.edge').forEach(edge => {
-    const order = Number((edge as HTMLElement).dataset.playbackOrder)
-    const isVisible = Number.isFinite(order) && order <= currentOrder
-    edge.classList.toggle('playback-hidden', !isVisible)
-    edge.setAttribute('aria-hidden', String(!isVisible))
-    if (!isVisible) return
+    if (edge.classList.contains('approve-edge')) {
+      const edgeOrder = getEdgeOrder(edge)
+      const link = callTreeLinks.value.find(item => item.edge_id === edgeOrder)
+        ?? edgeLinks.value.find(item => item.edge_id === edgeOrder)
+      const evidenceSteps = (link?.evidence || [])
+        .map(item => Number(item.source_step))
+        .filter(Number.isFinite)
+      const approvalStep = evidenceSteps.length > 0 ? Math.max(...evidenceSteps) : null
+      const isVisible = !isPlaybackActivated.value || (
+        approvalStep !== null
+        && cutoffStep !== undefined
+        && approvalStep <= cutoffStep
+      )
+      edge.classList.toggle('playback-hidden', !isVisible)
+      edge.setAttribute('aria-hidden', String(!isVisible || !showApproveEdges.value))
+      if (!isVisible) return
+    } else {
+      const order = Number((edge as HTMLElement).dataset.playbackOrder)
+      const isVisible = Number.isFinite(order) && order <= currentOrder
+      edge.classList.toggle('playback-hidden', !isVisible)
+      edge.setAttribute('aria-hidden', String(!isVisible))
+      if (!isVisible) return
+    }
     const title = edge.querySelector('title')?.textContent?.trim() || ''
     title.split('->').forEach(nodeTitle => {
       const normalized = nodeTitle.trim()
       if (normalized) visibleNodeTitles.add(normalized)
     })
   })
+  applyApproveVisibility()
 
   svg.querySelectorAll('.node').forEach(node => {
     const title = node.querySelector('title')?.textContent?.trim() || ''
@@ -856,18 +896,26 @@ function harmonizeEdgeAppearance(edgeEl: SVGElement) {
   const edgeText = Array.from(edgeEl.querySelectorAll<SVGTextElement>('text'))
   const label = edgeText.map(el => el.textContent || '').join(' ').trim()
   const tokenName = inferTokenNameFromLabel(edgeText, label)
-  // The backend colors every transfer from its canonical token address. Keep
-  // that color for ordinary transfers and mint/burn edges alike; parsing the
-  // visible symbol is only a fallback for older SVG artifacts.
+  // Keep edge strokes on their canonical token color, but darken label text
+  // from that same color so pastel contract palettes remain readable.
   const sourceColor = getGraphvizEdgeColor(edgeEl)
   const accent = sourceColor || getDarkAccentForName(tokenName)
-  const textColor = sourceColor || getThemeDarkTextColor(tokenName)
+  const textColor = getReadableTextOnLight(
+    sourceColor || getThemeDarkTextColor(tokenName),
+  )
 
   edgeEl.querySelectorAll<SVGPathElement>('path:not(.hit-area)').forEach((path) => {
     if (path.getAttribute('fill') === 'none') {
       path.setAttribute('stroke', accent)
       path.style.stroke = accent
       path.style.strokeWidth = '1.8px'
+      if (edgeEl.classList.contains('approve-edge')) {
+        path.setAttribute('stroke-dasharray', '10 4 2 4')
+        path.style.strokeDasharray = '10 4 2 4'
+      } else if (edgeEl.classList.contains('mint-burn-edge')) {
+        path.setAttribute('stroke-dasharray', '5 4')
+        path.style.strokeDasharray = '5 4'
+      }
     }
   })
 
@@ -896,10 +944,10 @@ function getGraphvizEdgeColor(edgeEl: SVGElement): string | null {
 function inferTokenNameFromLabel(texts: SVGTextElement[], label: string): string | null {
   const firstLine = texts[0]?.textContent?.trim() || ''
   const firstLineMatch = firstLine.match(
-    /^\(\d+\)\s+(.+?)(?:\((?:mint|burn)\))?\s*:/i,
+    /^\(\d+\)\s+(.+?)(?:\((?:mint|burn|approve)\))?\s*:/i,
   )
   if (firstLineMatch?.[1]) return firstLineMatch[1].trim()
-  const match = label.match(/\)\s+(.+?)(?:\((?:mint|burn)\))?\s*:/i)
+  const match = label.match(/\)\s+(.+?)(?:\((?:mint|burn|approve)\))?\s*:/i)
   return match?.[1]?.trim() || null
 }
 
@@ -1045,6 +1093,55 @@ function displayTokenAddress(address: string): string {
   return address.length > 14 ? `${address.slice(0, 8)}…${address.slice(-4)}` : address
 }
 
+function applyApproveVisibility() {
+  const svg = graphContainer.value?.querySelector('svg')
+  if (!svg) return
+  svg.querySelectorAll('.edge.approve-edge').forEach(edge => {
+    const hidden = !showApproveEdges.value
+    edge.classList.toggle('approve-hidden', hidden)
+    edge.setAttribute(
+      'aria-hidden',
+      String(hidden || edge.classList.contains('playback-hidden')),
+    )
+  })
+}
+
+async function toggleApproveEdges() {
+  const nextVisible = !showApproveEdges.value
+  const txHash = props.txHash
+  if (!txHash || relayoutState.value === 'loading') return
+  if (!nextVisible && selectedEdgeId.value !== null) {
+    const selectedApprove = Array.from(
+      graphContainer.value?.querySelectorAll('.edge.approve-edge') || [],
+    ).some(edge => getEdgeOrder(edge) === selectedEdgeId.value)
+    if (selectedApprove) {
+      selectedEdgeId.value = null
+      mappingNotice.value = ''
+      emit('graph-navigate', null)
+    }
+  }
+
+  const requestId = ++relayoutRequestId
+  relayoutState.value = 'loading'
+  relayoutError.value = ''
+  try {
+    let svgSource = nextVisible ? approveSvgSource.value : fullSvgSource.value
+    if (!svgSource) {
+      svgSource = await fetchTfgSvg(txHash, nextVisible)
+      if (nextVisible) approveSvgSource.value = svgSource
+      else fullSvgSource.value = svgSource
+    }
+    if (requestId !== relayoutRequestId || props.txHash !== txHash) return
+    showApproveEdges.value = nextVisible
+    relayoutState.value = 'idle'
+    await renderGraph(svgSource, loadRequestId, true)
+  } catch (error: any) {
+    if (requestId !== relayoutRequestId) return
+    relayoutState.value = 'error'
+    relayoutError.value = error?.message || 'Failed to switch the approve-edge layout'
+  }
+}
+
 function toggleAddressCycles() {
   activeCycleView.value = (
     activeCycleView.value === 'address-cycles' ? null : 'address-cycles'
@@ -1144,14 +1241,14 @@ function navigateToCfgForEdge(edgeId: number) {
   const callTreeLink = callTreeLinks.value.find(l => l.edge_id === edgeId)
   const notices: string[] = []
   if (!link) notices.push(`No ${props.cfgMode} CFG mapping is available for edge ${edgeId}.`)
-  else if (link.mapping_status === 'partial') notices.push('Only part of this transfer evidence could be mapped to the CFG.')
-  else if (link.mapping_status === 'ambiguous') notices.push('This transfer matched multiple CFG nodes at the same step.')
-  else if (link.mapping_status === 'unmatched') notices.push('This transfer could not be mapped to a CFG execution step.')
+  else if (link.mapping_status === 'partial') notices.push('Only part of this edge evidence could be mapped to the CFG.')
+  else if (link.mapping_status === 'ambiguous') notices.push('This edge matched multiple CFG nodes at the same step.')
+  else if (link.mapping_status === 'unmatched') notices.push('This edge could not be mapped to a CFG execution step.')
 
   if (!callTreeLink) notices.push(`No Call Tree mapping is available for edge ${edgeId}.`)
-  else if (callTreeLink.mapping_status === 'partial') notices.push('Only part of this transfer evidence could be mapped to the Call Tree.')
-  else if (callTreeLink.mapping_status === 'ambiguous') notices.push('This transfer matched ambiguous Call Tree frames.')
-  else if (callTreeLink.mapping_status === 'unmatched') notices.push('This transfer could not be mapped to a Call Tree contract.')
+  else if (callTreeLink.mapping_status === 'partial') notices.push('Only part of this edge evidence could be mapped to the Call Tree.')
+  else if (callTreeLink.mapping_status === 'ambiguous') notices.push('This edge matched ambiguous Call Tree frames.')
+  else if (callTreeLink.mapping_status === 'unmatched') notices.push('This edge could not be mapped to a Call Tree contract.')
   mappingNotice.value = notices.join(' ')
 
   const blockIds: BlockId[] = []
@@ -1195,12 +1292,19 @@ function fitGraphToViewport() {
   resetSvgViewport?.()
 }
 
+function handleTfgFit() {
+  void togglePlaybackRelayout()
+}
+
 async function restoreFullTfgLayout() {
   relayoutRequestId += 1
   relayoutState.value = 'idle'
   relayoutError.value = ''
-  if (!fullSvgSource.value) return
-  await renderGraph(fullSvgSource.value, loadRequestId, true)
+  const svgSource = showApproveEdges.value
+    ? approveSvgSource.value
+    : fullSvgSource.value
+  if (!svgSource) return
+  await renderGraph(svgSource, loadRequestId, true)
 }
 
 async function togglePlaybackRelayout() {
@@ -1208,27 +1312,37 @@ async function togglePlaybackRelayout() {
     await restoreFullTfgLayout()
     return
   }
-  const maxOrder = currentPlaybackStep.value?.visibleTransferOrder ?? -1
   if (
     !props.txHash
-    || !canRelayoutPlayback.value
     || relayoutState.value === 'loading'
-    || maxOrder < 0
   ) return
+
+  const svg = graphContainer.value?.querySelector('svg')
+  const visibleEdgeOrders = svg
+    ? Array.from(svg.querySelectorAll('.edge'))
+      .filter(edge => !(
+        edge.classList.contains('approve-hidden')
+        || edge.classList.contains('playback-hidden')
+        || edge.classList.contains('arb-muted')
+      ))
+      .map(getEdgeOrder)
+      .filter((order): order is number => order !== null)
+    : []
+  if (visibleEdgeOrders.length === 0) return
 
   const txHash = props.txHash
   const requestId = ++relayoutRequestId
   relayoutState.value = 'loading'
   relayoutError.value = ''
   try {
-    const svgSource = await fetchTfgPlaybackRelayout(txHash, maxOrder)
+    const svgSource = await fetchTfgRelayout(txHash, visibleEdgeOrders)
     if (requestId !== relayoutRequestId || props.txHash !== txHash) return
     relayoutState.value = 'active'
     await renderGraph(svgSource, loadRequestId, true)
   } catch (error: any) {
     if (requestId !== relayoutRequestId) return
     relayoutState.value = 'error'
-    relayoutError.value = error?.message || 'Failed to relayout the TFG playback prefix'
+    relayoutError.value = error?.message || 'Failed to relayout the visible TFG content'
   }
 }
 
@@ -1242,6 +1356,22 @@ onBeforeUnmount(() => {
   <div class="afg-panel">
     <span class="panel-label">(C) Token Flow Graph</span>
     <div class="graph-actions">
+      <button
+        v-if="status === 'success' && approveEdgeCount > 0"
+        type="button"
+        class="approve-toggle-button"
+        :class="{ active: showApproveEdges }"
+        :aria-pressed="showApproveEdges"
+        :aria-label="`${showApproveEdges ? 'Hide' : 'Show'} ${approveEdgeCount} approve edges`"
+        :title="`${showApproveEdges ? 'Hide' : 'Show'} approve edges`"
+        @click="toggleApproveEdges"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3 12s3.5-6 9-6 9 6 9 6-3.5 6-9 6-9-6-9-6z" />
+          <circle cx="12" cy="12" r="2.5" />
+        </svg>
+        <span>Approve {{ approveEdgeCount }}</span>
+      </button>
       <div class="playback-controls" role="group" aria-label="Execution playback controls">
         <button
           type="button"
@@ -1287,12 +1417,14 @@ onBeforeUnmount(() => {
       </div>
       <GraphFitButton
         graph-name="token flow graph"
-        :disabled="!canRelayoutPlayback"
+        :disabled="status !== 'success'"
         :loading="relayoutState === 'loading'"
         :active="relayoutState === 'active'"
-        :action-label="`Relayout TFG playback prefix through transfer ${currentPlaybackStep?.visibleTransferOrder ?? 0}`"
+        :action-label="canRelayoutPlayback
+          ? `Relayout visible TFG playback prefix through transfer ${currentPlaybackStep?.visibleTransferOrder ?? 0}`
+          : 'Relayout currently visible token flow graph'"
         active-label="Restore full token flow graph layout"
-        @fit="togglePlaybackRelayout"
+        @fit="handleTfgFit"
       />
       <GraphExpandButton
         graph-name="token flow graph"
@@ -1525,6 +1657,49 @@ onBeforeUnmount(() => {
   gap: 4px;
 }
 
+.approve-toggle-button {
+  position: relative;
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: 1px dashed rgba(180, 83, 9, 0.48);
+  border-radius: 5px;
+  color: #9a3412;
+  background: rgba(255, 247, 237, 0.96);
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.approve-toggle-button::before {
+  content: '';
+  position: absolute;
+  inset: -8px 0;
+}
+
+.approve-toggle-button:hover,
+.approve-toggle-button.active {
+  border-color: #c2410c;
+  background: #ffedd5;
+}
+
+.approve-toggle-button:focus-visible {
+  outline: 2px solid #c2410c;
+  outline-offset: 2px;
+}
+
+.approve-toggle-button svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  pointer-events: none;
+}
+
 .playback-button {
   position: relative;
   width: 28px;
@@ -1708,6 +1883,11 @@ onBeforeUnmount(() => {
 
 .graph-viewport :deep(.node.playback-hidden),
 .graph-viewport :deep(.edge.playback-hidden) {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.graph-viewport :deep(.edge.approve-hidden) {
   opacity: 0 !important;
   pointer-events: none !important;
 }

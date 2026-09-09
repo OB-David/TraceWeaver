@@ -1264,7 +1264,7 @@ function edgeColor(edge: TreeEdgeLayout): string {
 
 .tree-edge.reverted-subtree,
 .tree-node.reverted-subtree {
-  opacity: 0.38;
+  opacity: 0.75;
 }
 
 .tree-node { cursor: pointer; }

@@ -2,9 +2,11 @@
 
 The detector uses directed, token-labelled transfer edges. Mint and burn stay
 visible in the TFG as supply-boundary evidence, but they do not participate in
-cycle detection. The detector enumerates elementary address cycles, rotates
-them into token transformations at each shared address, and finds minimal
-token closures by:
+cycle detection. Two-address round trips whose two edges transfer the same
+token are also excluded: they do not describe a token transformation. The
+detector enumerates the remaining elementary address cycles, rotates them into
+token transformations at each shared address, and enumerates elementary token
+closures. Candidate ordering remains deterministic by:
 
 1. number of distinct TFG edges;
 2. number of elementary address cycles.
@@ -27,7 +29,7 @@ from itertools import count
 from typing import Any
 
 
-TFG_CYCLE_SCHEMA_VERSION = 5
+TFG_CYCLE_SCHEMA_VERSION = 7
 
 NATIVE_ETH_TOKEN_IDENTITY = "eth"
 ETHEREUM_MAINNET_WETH_ADDRESS = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
@@ -204,6 +206,15 @@ def enumerate_atomic_address_cycles(
             tuple(edge.edge_id for edge in item[1]),
         ),
     ):
+        # A -> B -> A in one exact asset is only a same-token round trip. It
+        # must not become an atomic candidate address cycle, even when the two
+        # amounts differ. Compare canonical token addresses here rather than
+        # display symbols or closure identities (for example ETH/WETH).
+        if (
+            len(path_edges) == 2
+            and path_edges[0].token_address == path_edges[1].token_address
+        ):
+            continue
         signature = tuple(edge.edge_id for edge in path_edges)
         if signature in seen:
             continue
@@ -253,7 +264,14 @@ def _anchor_options(
 def find_minimal_structural_paths(
     atomic_cycles: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Find minimal token closures composed of edge-disjoint cycles at one address."""
+    """Find elementary token closures composed of edge-disjoint cycles at one address.
+
+    Every token-simple closure is retained here. In particular, finding a
+    shorter closure for one anchor and closing asset must not suppress a
+    longer closure that uses a disjoint set of transfer edges. The later exact
+    set-packing stage is responsible for resolving paths that really do share
+    edges.
+    """
     options = _anchor_options(atomic_cycles)
     by_anchor_token: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     start_tokens: dict[str, set[str]] = defaultdict(set)
@@ -274,7 +292,6 @@ def find_minimal_structural_paths(
                 0, 0, next(serial), start_token, tuple(), frozenset(),
                 frozenset(), (start_token,),
             )]
-            best_cost: tuple[int, int] | None = None
             while heap:
                 (
                     edge_count,
@@ -286,9 +303,6 @@ def find_minimal_structural_paths(
                     used_edges,
                     token_path,
                 ) = heapq.heappop(heap)
-                cost = (edge_count, cycle_count)
-                if best_cost is not None and cost >= best_cost:
-                    continue
 
                 for option in by_anchor_token.get((anchor, current_token), []):
                     cycle_id = option["atomic_cycle_id"]
@@ -298,9 +312,6 @@ def find_minimal_structural_paths(
                     next_token = option["token_out_identity"]
                     next_edge_count = len(used_edges | option_edges)
                     next_cycle_count = cycle_count + 1
-                    next_cost = (next_edge_count, next_cycle_count)
-                    if best_cost is not None and next_cost > best_cost:
-                        continue
                     next_option_path = (*option_path, option)
                     next_token_path = (*token_path, next_token)
                     if next_token == start_token:
@@ -310,44 +321,41 @@ def find_minimal_structural_paths(
                         )
                         if amount_delta_raw == 0:
                             continue
-                        if best_cost is None:
-                            best_cost = next_cost
-                        if next_cost == best_cost:
-                            closures.append({
-                                "anchor_address": anchor,
-                                "token_address_path": [
-                                    next_option_path[0]["token_in_address"],
-                                    *[
-                                        item["token_out_address"]
-                                        for item in next_option_path
-                                    ],
-                                ],
-                                "token_identity_path": list(next_token_path),
-                                "atomic_cycle_ids": [
-                                    item["atomic_cycle_id"] for item in next_option_path
-                                ],
-                                "address_cycle_paths": [
-                                    item["rotated_nodes"] for item in next_option_path
-                                ],
-                                "cycle_edge_orders": [
-                                    item["rotated_edge_orders"] for item in next_option_path
-                                ],
-                                "transfer_edge_orders": [
-                                    edge_id
+                        closures.append({
+                            "anchor_address": anchor,
+                            "token_address_path": [
+                                next_option_path[0]["token_in_address"],
+                                *[
+                                    item["token_out_address"]
                                     for item in next_option_path
-                                    for edge_id in item["rotated_edge_orders"]
                                 ],
-                                "arbitrage_token_address": (
-                                    next_option_path[0]["token_in_address"]
-                                ),
-                                "arbitrage_token_identity": start_token,
-                                "arbitrage_amount_delta_raw": str(amount_delta_raw),
-                                "_arbitrage_token_order": (
-                                    next_option_path[0]["rotated_edge_orders"][0]
-                                ),
-                                "edge_count": next_edge_count,
-                                "atomic_cycle_count": next_cycle_count,
-                            })
+                            ],
+                            "token_identity_path": list(next_token_path),
+                            "atomic_cycle_ids": [
+                                item["atomic_cycle_id"] for item in next_option_path
+                            ],
+                            "address_cycle_paths": [
+                                item["rotated_nodes"] for item in next_option_path
+                            ],
+                            "cycle_edge_orders": [
+                                item["rotated_edge_orders"] for item in next_option_path
+                            ],
+                            "transfer_edge_orders": [
+                                edge_id
+                                for item in next_option_path
+                                for edge_id in item["rotated_edge_orders"]
+                            ],
+                            "arbitrage_token_address": (
+                                next_option_path[0]["token_in_address"]
+                            ),
+                            "arbitrage_token_identity": start_token,
+                            "arbitrage_amount_delta_raw": str(amount_delta_raw),
+                            "_arbitrage_token_order": (
+                                next_option_path[0]["rotated_edge_orders"][0]
+                            ),
+                            "edge_count": next_edge_count,
+                            "atomic_cycle_count": next_cycle_count,
+                        })
                         continue
                     if next_token in token_path:
                         continue

@@ -108,3 +108,45 @@ export function getReadableTextOnDark(color: string | null | undefined) {
   const normalized = normalizeColor(color)
   return normalized === '#b6b6b6' ? '#1f2937' : '#ffffff'
 }
+
+export function getReadableTextOnLight(
+  color: string | null | undefined,
+  fallback = '#374151',
+) {
+  const match = /^#([a-f0-9]{6})(?:[a-f0-9]{2})?$/.exec(normalizeColor(color))
+  if (!match?.[1]) return fallback
+
+  const channels = [0, 2, 4].map(offset =>
+    Number.parseInt(match[1]!.slice(offset, offset + 2), 16),
+  )
+  const relativeLuminance = (values: number[]) => {
+    const linear = values.map((value) => {
+      const channel = value / 255
+      return channel <= 0.04045
+        ? channel / 12.92
+        : ((channel + 0.055) / 1.055) ** 2.4
+    })
+    return 0.2126 * linear[0]! + 0.7152 * linear[1]! + 0.0722 * linear[2]!
+  }
+  const hasReadableContrast = (values: number[]) => (
+    1.05 / (relativeLuminance(values) + 0.05) >= 4.5
+  )
+
+  if (hasReadableContrast(channels)) return `#${match[1].toUpperCase()}`
+
+  // Preserve the source hue while finding the lightest darker shade that
+  // reaches the normal-text contrast threshold on the white graph canvas.
+  let readableScale = 0
+  let unreadableScale = 1
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const scale = (readableScale + unreadableScale) / 2
+    const candidate = channels.map(channel => Math.round(channel * scale))
+    if (hasReadableContrast(candidate)) readableScale = scale
+    else unreadableScale = scale
+  }
+  const readableChannels = channels.map(channel => Math.round(channel * readableScale))
+  return `#${readableChannels
+    .map(channel => channel.toString(16).padStart(2, '0'))
+    .join('')
+    .toUpperCase()}`
+}

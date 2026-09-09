@@ -27,7 +27,7 @@ htmlcov/
 
 # Runtime data and local experiments
 /data_base/
-/testcode/
+/reference/result/
 /历史方案文档/
 /llm_draft/
 /backend/tests/

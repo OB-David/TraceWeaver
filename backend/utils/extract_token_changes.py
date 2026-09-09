@@ -40,6 +40,12 @@ THEME_DARKS = [
 
 FILL_TO_DARK = {fill.lower(): dark for fill, dark in zip(THEME_FILLS, THEME_DARKS)}
 
+# A one-unit residual can be introduced by integer rounding in tokens whose
+# accounting writes do not divide perfectly.  Apply this only after another
+# balance pair for the same token has established an ordinary transfer; a
+# standalone one-unit change may still be a real mint or burn.
+UNMATCHED_ERC20_DUST_TOLERANCE_RAW = 1
+
 def dark_accent(color: str | None, fallback: str = "#6B7280") -> str:
     if not color:
         return fallback
@@ -68,7 +74,24 @@ def format_scientific_html(value: float, precision: int = 4, sup_size: int = 8) 
     return f"{mantissa}×10<sup><font point-size='{sup_size}'>{exp}</font></sup>"
 
 
-def pair_transactions(original_transfer, all_changes, token_decimals_map=None):
+def format_raw_units(raw_value: int, decimals: int) -> str:
+    """Format an integer token value exactly for plain-text tooltips."""
+    sign = "-" if raw_value < 0 else ""
+    digits = str(abs(raw_value))
+    if decimals <= 0:
+        return sign + digits
+    digits = digits.zfill(decimals + 1)
+    whole = digits[:-decimals]
+    fraction = digits[-decimals:].rstrip("0")
+    return sign + whole + (f".{fraction}" if fraction else "")
+
+
+def pair_transactions(
+    original_transfer,
+    all_changes,
+    token_decimals_map=None,
+    unmatched_dust_tolerance_raw=UNMATCHED_ERC20_DUST_TOLERANCE_RAW,
+):
     """
     按 all_changes 顺序配对余额变化并确定交易顺序
     【正确版】
@@ -76,7 +99,8 @@ def pair_transactions(original_transfer, all_changes, token_decimals_map=None):
     2. 逐个尝试匹配正负抵消的变化
     3. 匹配成功 → 移除
     4. 最后剩下的 → 纯孤立变动
-    5. 绝对不覆盖、不丢失
+    5. 已有同 token 正常配对时，±1 raw unit 尾差降级为 unmatched_dust
+    6. 原始变化仍保留在 balance_and_eth_changes.json 中
     """
     paired = []
     node_annotations = defaultdict(list)
@@ -313,8 +337,34 @@ def pair_transactions(original_transfer, all_changes, token_decimals_map=None):
                 queue.pop()
 
 
-    for q in token_queues.values():
-        pending_erc20.extend(q)
+    try:
+        dust_tolerance = max(0, int(unmatched_dust_tolerance_raw))
+    except (TypeError, ValueError):
+        dust_tolerance = UNMATCHED_ERC20_DUST_TOLERANCE_RAW
+
+    paired_token_addresses = {
+        str(item.get("token_addr", "")).lower()
+        for item in paired
+        if str(item.get("token_addr", "")).lower() not in {"", "eth"}
+    }
+    for token_addr, queue in token_queues.items():
+        normalized_token = str(token_addr).lower()
+        for change in queue:
+            raw_value = int(change.get("value", 0))
+            is_dust = (
+                dust_tolerance > 0
+                and 0 < abs(raw_value) <= dust_tolerance
+                and normalized_token in paired_token_addresses
+            )
+            if is_dust:
+                node_annotations[change.get("user")].append({
+                    **change,
+                    "classification": "unmatched_dust",
+                    "ignored_for_asset_flow": True,
+                    "dust_tolerance_raw": dust_tolerance,
+                })
+                continue
+            pending_erc20.append(change)
 
     # 压缩序号，保证最终序号连续且保持原始先后关系
     combined = []
@@ -436,7 +486,123 @@ def build_balance_timeline(paired: list, pending_erc20: list = None) -> dict:
     return {"schema_version": 1, "events": events}
 
 
-def collect_asset_flow_addresses(paired, pending_erc20):
+def extract_allowance_changes(
+    steps,
+    allowance_slot_map,
+    erc20_token_map,
+    token_decimals_map=None,
+):
+    """Recover writes to ERC-20 allowance slots without treating them as balances."""
+    token_names = {
+        str(address).lower(): (
+            str(metadata.get("name") or metadata.get("symbol") or "ERC20")
+            if isinstance(metadata, dict) else str(metadata)
+        )
+        for address, metadata in (erc20_token_map or {}).items()
+    }
+    decimals_by_token = {
+        str(address).lower(): int(decimals)
+        for address, decimals in (token_decimals_map or {}).items()
+    }
+    slots = {str(slot).lower(): metadata for slot, metadata in (allowance_slot_map or {}).items()}
+    loaded = {}
+    current_values = {}
+    changes = []
+
+    for index, step in enumerate(steps or []):
+        opcode = str(step.get("opcode") or "").upper()
+        if opcode not in {"SLOAD", "SSTORE"}:
+            continue
+        stack = step.get("stack") or []
+        if not stack:
+            continue
+        slot = str(stack[-1]).lower()
+        slot_metadata = slots.get(slot)
+        if slot_metadata is None:
+            continue
+        token_address = str(step.get("RW_address") or step.get("address") or "").lower()
+        token_name = token_names.get(token_address)
+        if not token_name:
+            # Nested mappings in non-token contracts are not ERC-20 approvals.
+            continue
+        trace_key = (token_address, slot)
+
+        if opcode == "SLOAD":
+            next_stack = steps[index + 1].get("stack", []) if index + 1 < len(steps) else []
+            if not next_stack:
+                continue
+            old_value = hex_to_int_safe(next_stack[-1])
+            loaded[trace_key] = {
+                "value": old_value,
+                "step": index,
+                "pc": step.get("pc"),
+            }
+            current_values[trace_key] = old_value
+            continue
+
+        if len(stack) < 2:
+            continue
+        new_value = hex_to_int_safe(stack[-2])
+        load = loaded.pop(trace_key, None)
+        old_value = load["value"] if load is not None else current_values.get(trace_key)
+        current_values[trace_key] = new_value
+        changes.append({
+            "type": "ERC20_ALLOWANCE_CHANGE",
+            "codecontract_address": step.get("address"),
+            "erc20_token_address": token_address,
+            "token_name": token_name,
+            "decimals": decimals_by_token.get(token_address, 18),
+            "owner_address": str(slot_metadata["owner_address"]).lower(),
+            "spender_address": str(slot_metadata["spender_address"]).lower(),
+            "allowance_slot": slot,
+            "old_allowance": str(old_value) if old_value is not None else None,
+            "new_allowance": str(new_value),
+            "changed_allowance": str(new_value - old_value) if old_value is not None else None,
+            "SLOAD_pc": load["pc"] if load is not None else None,
+            "SLOAD_step": load["step"] if load is not None else None,
+            "SSTORE_pc": step.get("pc"),
+            "SSTORE_step": index,
+            "owner_mapping_hash": slot_metadata.get("owner_mapping_hash"),
+            "owner_mapping_base_slot": slot_metadata.get("owner_mapping_base_slot"),
+        })
+    return changes
+
+
+def build_approval_edges(paired, pending_erc20, allowance_changes):
+    """Give approval events stable, non-conflicting TFG edge IDs."""
+    last_order = max(
+        [int(item["order"]) for item in [*(paired or []), *(pending_erc20 or [])]],
+        default=-1,
+    )
+    approvals = []
+    for index, change in enumerate(
+        sorted(allowance_changes or [], key=lambda item: int(item.get("SSTORE_step") or 0)),
+        start=1,
+    ):
+        new_value = int(change["new_allowance"])
+        changed_value = (
+            int(change["changed_allowance"])
+            if change.get("changed_allowance") is not None else None
+        )
+        decimals = int(change.get("decimals", 18))
+        approvals.append({
+            **change,
+            "order": last_order + index,
+            "approve_order": index,
+            "edge_kind": "approve",
+            "from": change["owner_address"],
+            "to": change["spender_address"],
+            "token": change["token_name"],
+            "token_addr": change["erc20_token_address"],
+            "amount": abs(changed_value if changed_value is not None else new_value) / (10 ** decimals),
+            "amount_raw": abs(changed_value if changed_value is not None else new_value),
+            "source_pcs": [change.get("SLOAD_pc"), change.get("SSTORE_pc")],
+            "source_steps": [change.get("SLOAD_step"), change.get("SSTORE_step")],
+        })
+    return approvals
+
+
+def collect_asset_flow_addresses(paired, pending_erc20, approvals=None):
     """Collect the exact node addresses represented in the asset-flow graph."""
     addresses = set()
     for transfer in paired:
@@ -449,14 +615,19 @@ def collect_asset_flow_addresses(paired, pending_erc20):
             address = change.get(field)
             if address:
                 addresses.add(address)
+    for approval in approvals or []:
+        for field in ("from", "to"):
+            address = approval.get(field)
+            if address:
+                addresses.add(address)
     return addresses
 
 
-def filter_asset_flow_user_addresses(users_addresses, paired, pending_erc20):
+def filter_asset_flow_user_addresses(users_addresses, paired, pending_erc20, approvals=None):
     """Keep only standardized users that are actual asset-flow graph nodes."""
     asset_flow_addresses = {
         address.lower()
-        for address in collect_asset_flow_addresses(paired, pending_erc20)
+        for address in collect_asset_flow_addresses(paired, pending_erc20, approvals)
         if isinstance(address, str)
     }
     return [
@@ -470,7 +641,8 @@ def render_asset_flow(paired, node_annotations, users_addresses,
                       full_address_name_map, pending_erc20, addr_color_map,
                       output_file="asset_flow.dot",
                       arb_edge_orders: set = None,
-                      erc20_token_map: Optional[Dict[str, Any]] = None):
+                      erc20_token_map: Optional[Dict[str, Any]] = None,
+                      approvals=None):
     dot = Digraph(engine="dot")
     dot.graph_attr.update({
         'rankdir': 'TB',
@@ -500,7 +672,7 @@ def render_asset_flow(paired, node_annotations, users_addresses,
     user_alias_map = {addr: full_address_name_map.get(addr) for addr in users_set}
 
     # 和 legend 共用同一套 TFG 节点收集语义。
-    addresses = collect_asset_flow_addresses(paired, pending_erc20)
+    addresses = collect_asset_flow_addresses(paired, pending_erc20, approvals)
 
     # 建立地址到地址的映射（不去重：节点数量与地址数量一致）
     name_to_addrs = {}
@@ -566,7 +738,11 @@ def render_asset_flow(paired, node_annotations, users_addresses,
                  label="<" + edge_label + ">",
                  color=edge_color, fontcolor=edge_color,
                  penwidth=penwidth, arrowsize=arrowsize,
-                 style="solid" + extra_style)
+                 style="solid" + extra_style,
+                 _attributes={
+                     "class": "transfer-edge",
+                     "id": f"tfg-edge-{p['order']}",
+                 })
 
     # 2. 绘制所有孤立的 ERC20/NFT 变化（虚线边：表示铸造或销毁）
     for v in pending_erc20:
@@ -599,6 +775,44 @@ def render_asset_flow(paired, node_annotations, users_addresses,
             style="dashed, bold" if is_arb else "dashed",
             penwidth="3.1" if is_arb else "1.5",
             arrowsize="1.02" if is_arb else "0.78",
+            _attributes={
+                "class": "mint-burn-edge",
+                "id": f"tfg-edge-{v['order']}",
+            },
+        )
+
+    # 3. allowance 是虚拟资产边：参与布局与点击联动，但不参与余额或套利计算。
+    for approval in approvals or []:
+        edge_fill = addr_color_map.get(approval["token_addr"], "#E2E2E2")
+        edge_color = dark_accent(edge_fill, "#6B7280")
+        decimals = int(approval.get("decimals", 18))
+        new_raw = int(approval["new_allowance"])
+        changed_raw = approval.get("changed_allowance")
+        if changed_raw is None:
+            amount_text = f"set {format_raw_units(new_raw, decimals)}"
+        else:
+            changed_value = int(changed_raw)
+            prefix = "+" if changed_value > 0 else ""
+            amount_text = f"{prefix}{format_raw_units(changed_value, decimals)}"
+        approve_order = int(approval.get("approve_order", approval["order"]))
+        edge_label = f"[{approve_order}]"
+        tooltip_text = f"approve {approval['token']}: {amount_text}"
+        dot.edge(
+            approval["from"],
+            approval["to"],
+            label="<" + edge_label + ">",
+            color=edge_color,
+            fontcolor=edge_color,
+            style="dashed",
+            penwidth="1.7",
+            arrowsize="0.86",
+            arrowhead="vee",
+            tooltip=tooltip_text,
+            _attributes={
+                "class": "approve-edge",
+                "id": f"tfg-edge-{approval['order']}",
+                "approve_order": str(approve_order),
+            },
         )
 
     dot.save(output_file)
@@ -682,7 +896,7 @@ def _unique_matched_blocks(evidence: List[Dict[str, Any]]) -> List[Any]:
     ))
 
 
-def afg_to_fcfg(paired, pending_erc20, folded_cfg: CFG):
+def afg_to_fcfg(paired, pending_erc20, folded_cfg: CFG, approvals=None):
     step_index = build_folded_step_index(folded_cfg)
     edge_link = []
     for p in paired:
@@ -742,6 +956,25 @@ def afg_to_fcfg(paired, pending_erc20, folded_cfg: CFG):
             "evidence": evidence,
         })
 
+    for approval in approvals or []:
+        steps = approval.get("source_steps") or []
+        role_steps = [
+            ("allowance_sload", steps[0] if len(steps) > 0 else None),
+            ("allowance_sstore", steps[1] if len(steps) > 1 else None),
+        ]
+        evidence = [
+            _build_folded_evidence(step_index, role, step)
+            for role, step in role_steps if step is not None
+        ]
+        edge_link.append({
+            "schema_version": 2,
+            "edge_id": approval["order"],
+            "type": "ERC20_ALLOWANCE_CHANGE",
+            "mapping_status": _mapping_status(evidence),
+            "matched_blocks": _unique_matched_blocks(evidence),
+            "evidence": evidence,
+        })
+
     edge_link.sort(key=lambda x: x["edge_id"])
     return edge_link
 
@@ -784,7 +1017,7 @@ def find_node_by_step(cfg: CFG, step: int):
     return None
 
 
-def afg_to_pcfg(paired, pending_erc20, plain_cfg):
+def afg_to_pcfg(paired, pending_erc20, plain_cfg, approvals=None):
     edge_link = []
 
     for p in paired:
@@ -855,6 +1088,31 @@ def afg_to_pcfg(paired, pending_erc20, plain_cfg):
             "edge_id": v["order"],
             "type": "ERC20_BALANCE_CHANGE",
             "matched_blocks": [sload_block, sstore_block]
+        })
+
+    for approval in approvals or []:
+        steps = approval.get("source_steps") or []
+        evidence = []
+        for role, step in (
+            ("allowance_sload", steps[0] if len(steps) > 0 else None),
+            ("allowance_sstore", steps[1] if len(steps) > 1 else None),
+        ):
+            if step is None:
+                continue
+            block_id = find_node_by_step(plain_cfg, step)
+            evidence.append({
+                "role": role,
+                "source_step": int(step),
+                "block_id": block_id,
+                "status": "matched" if block_id is not None else "unmatched",
+            })
+        edge_link.append({
+            "schema_version": 2,
+            "edge_id": approval["order"],
+            "type": "ERC20_ALLOWANCE_CHANGE",
+            "mapping_status": _mapping_status(evidence),
+            "matched_blocks": _unique_matched_blocks(evidence),
+            "evidence": evidence,
         })
 
     edge_link.sort(key=lambda x: x["edge_id"])
@@ -971,7 +1229,7 @@ def _unique_matched_calls(evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return matched
 
 
-def afg_to_call_tree(paired, pending_erc20, trace_tree: Dict[str, Any]):
+def afg_to_call_tree(paired, pending_erc20, trace_tree: Dict[str, Any], approvals=None):
     """Map each TFG transfer edge's source steps to its deepest call frames."""
     root_address, frames = _build_call_tree_step_index(trace_tree)
     edge_links = []
@@ -1021,10 +1279,22 @@ def afg_to_call_tree(paired, pending_erc20, trace_tree: Dict[str, Any]):
             ("balance_sstore", steps[1] if len(steps) > 1 else None),
         ])
 
+    for approval in approvals or []:
+        steps = approval.get("source_steps") or []
+        role_steps = [
+            ("allowance_sload", steps[0] if len(steps) > 0 else None),
+            ("allowance_sstore", steps[1] if len(steps) > 1 else None),
+        ]
+        append_link(
+            approval["order"],
+            "ERC20_ALLOWANCE_CHANGE",
+            [(role, step) for role, step in role_steps if step is not None],
+        )
+
     edge_links.sort(key=lambda item: item["edge_id"])
     return edge_links
 
-LINK_ARTIFACT_SCHEMA_VERSION = 1
+LINK_ARTIFACT_SCHEMA_VERSION = 2
 
 
 def build_link_artifact(folded_links, plain_links, call_tree_links=None):

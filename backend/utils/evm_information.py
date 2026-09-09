@@ -1,4 +1,4 @@
-from typing import List, Dict, TypedDict, Set, Tuple, Optional
+from typing import Any, List, Dict, TypedDict, Set, Tuple, Optional
 import logging
 import time
 from web3 import Web3
@@ -838,13 +838,17 @@ class TraceFormatter:
                             # hex_len <= 2：被视为预编译合约或特殊地址，忽略（不标准化、不分类）
                             pass
 
-                        # 保持原来根据 is_valid_address & is_next_pc_zero 切换上下文的逻辑不变
-                        if is_valid_address and is_next_pc_zero:
+                        # 每个实际进入的调用帧都同时保存 code/storage 父上下文。
+                        # DELEGATECALL/CALLCODE 虽然继承父 storage 地址，仍然必须在
+                        # RW_stack 中占一帧；否则子帧 RETURN 会误弹外层 CALL 保存的地址。
+                        if is_valid_address and entered_child_call:
                             call_stack.append(current_address)
+                            RW_stack.append(RW_address)
                             next_address = to_address
-                            if opcode in {"CALL", "CALLCODE", "STATICCALL"}:
-                                RW_stack.append(RW_address)
+                            if opcode in {"CALL", "STATICCALL"}:
                                 next_RW_address = to_address
+                            else:  # DELEGATECALL / CALLCODE
+                                next_RW_address = RW_address
                         else:
                             next_address = current_address
                             next_RW_address = RW_address
@@ -863,7 +867,7 @@ class TraceFormatter:
                             if next_step_pc == "0x0" and new_address:
                                 call_stack.append(current_address)
                                 next_address = new_address
-                                RW_stack.append(current_address)
+                                RW_stack.append(RW_address)
                                 next_RW_address = new_address
                             else:
                                 next_address = current_address
@@ -911,11 +915,21 @@ class TraceFormatter:
             # 可选：打印识别结果
             print(f"识别出ERC20代理+逻辑合约总数: {len(erc20_token_map)}，更新后合约地址总数: {len(contracts_addresses)}") 
 
-            # final_users_addresses = （addresses_from_slots ∪ users_addresses_from_CALL \\ contracts_addresses）
-            slot_map = self.extract_slot_address_map({"steps": steps})
+            # 余额 mapping 与 allowance 二级 mapping 分开保留。后者不参与真实
+            # 余额配对，但会作为可选的 TFG 虚拟授权边。
+            slot_map, allowance_slot_map = self.extract_storage_slot_maps({"steps": steps})
             addresses_from_slots: Set[str] = set(slot_map.values())
+            addresses_from_allowances: Set[str] = {
+                address
+                for item in allowance_slot_map.values()
+                for address in (item["owner_address"], item["spender_address"])
+            }
             print(f"通过 slot_map 识别到地址数量: {len(addresses_from_slots)}")
-            final_users_addresses_set: Set[str] = (addresses_from_slots.union(users_addresses_from_CALL)) - contracts_addresses
+            final_users_addresses_set: Set[str] = (
+                addresses_from_slots
+                .union(addresses_from_allowances)
+                .union(users_addresses_from_CALL)
+            ) - contracts_addresses
 
             # ========== 新增：将交易发起者加入用户地址集合 ==========
             if tx_sender_address and tx_sender_address not in contracts_addresses:
@@ -940,6 +954,7 @@ class TraceFormatter:
                 "contracts_addresses": sorted(list(contracts_addresses)),
                 "erc20_token_map": erc20_token_map,  # 新增：ERC20地址->名称映射（包含代理和逻辑合约）
                 "slot_map": slot_map,
+                "allowance_slot_map": allowance_slot_map,
                 "users_addresses": sorted(list(final_users_addresses_set)),
                 "full_address_name_map": full_address_name_map,
                 "tx_sender_address": tx_sender_address  # 新增：交易发起者地址
@@ -953,14 +968,18 @@ class TraceFormatter:
     def extract_contracts_from_trace(self, standardized_trace: StandardizedTrace) -> Set[str]:
         return {step["address"] for step in standardized_trace["steps"] if step["address"]}
 
-    # 从 KECCAK 的 memory 输入中提取 slot 对应的地址
-    def extract_slot_address_map(self, standardized_trace: Dict) -> Dict[str, str]:
+    # 从 KECCAK 的 memory 输入中区分余额 slot 与 allowance 二级 mapping slot。
+    def extract_storage_slot_maps(
+        self,
+        standardized_trace: Dict,
+    ) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
         """
         按 trace 顺序处理 KECCAK：
         - stack[-1] 是 memory offset，stack[-2] 是 memory size
         - 64 字节的标准 mapping 输入由 address word 和 base slot word 组成
         - 下一 step 的 stack[-1] 是 KECCAK 结果，即 storage slot
-        - base slot 若已存在于 slot_addr_map，当前结果是二级 mapping，不写入
+        - 一级 mapping 作为普通地址 slot
+        - base slot 若是先前的一级 mapping hash，则当前结果单独作为 allowance slot
         - 最后只返回实际被 SLOAD/SSTORE 使用过的 slot
         """
         steps = standardized_trace.get("steps", []) if isinstance(standardized_trace, dict) else standardized_trace["steps"]
@@ -990,8 +1009,9 @@ class TraceFormatter:
 
         # canonical slot -> SLOAD/SSTORE 栈中实际出现的字符串格式
         used_slots: Dict[str, Set[str]] = {}
-        # canonical slot -> address；同时承担此前 slot 历史的作用
-        slot_addr_map: Dict[str, str] = {}
+        # canonical hash -> mapping 计算来源。未被直接读写的一级 owner hash
+        # 也必须保留，因为它会成为二级 allowance mapping 的 base。
+        mapping_hashes: Dict[str, Dict[str, Any]] = {}
 
         for index, step in enumerate(steps):
             opcode = step.get("opcode", "").upper()
@@ -1041,21 +1061,44 @@ class TraceFormatter:
             if slot is None:
                 continue
 
-            # 第二部分引用已识别 slot，说明是 allowance 等二级 mapping。
-            if base_slot in slot_addr_map:
-                logger.debug(f"[slot_map] skip nested mapping slot: {slot}")
-                continue
-
             address = self._normalize_address(f"0x{address_word[-40:]}")
             if address:
-                slot_addr_map[slot] = address
+                parent = mapping_hashes.get(base_slot)
+                mapping_hashes[slot] = {
+                    "key_address": address,
+                    "base_slot": base_slot,
+                    "depth": int(parent["depth"]) + 1 if parent else 1,
+                    "parent_hash": base_slot if parent else None,
+                    "hash_step": index,
+                    "hash_pc": step.get("pc"),
+                }
 
         # 对外保留 trace 栈中的 slot 格式，兼容下游的直接字符串查表。
-        return {
-            raw_slot: address
-            for slot, address in slot_addr_map.items()
+        balance_slots = {
+            raw_slot: item["key_address"]
+            for slot, item in mapping_hashes.items()
+            if item["depth"] == 1
             for raw_slot in used_slots.get(slot, set())
         }
+        allowance_slots = {
+            raw_slot: {
+                "owner_address": mapping_hashes[item["parent_hash"]]["key_address"],
+                "spender_address": item["key_address"],
+                "owner_mapping_hash": item["parent_hash"],
+                "owner_mapping_base_slot": mapping_hashes[item["parent_hash"]]["base_slot"],
+                "owner_hash_step": mapping_hashes[item["parent_hash"]]["hash_step"],
+                "spender_hash_step": item["hash_step"],
+            }
+            for slot, item in mapping_hashes.items()
+            if item["depth"] == 2 and item["parent_hash"] in mapping_hashes
+            for raw_slot in used_slots.get(slot, set())
+        }
+        return balance_slots, allowance_slots
+
+    def extract_slot_address_map(self, standardized_trace: Dict) -> Dict[str, str]:
+        """Backward-compatible balance-slot-only view."""
+        balance_slots, _ = self.extract_storage_slot_maps(standardized_trace)
+        return balance_slots
 
     # 获取单个合约字节码（使用缓存）
     def get_contract_bytecode(self, contract_address: str) -> ContractBytecode:

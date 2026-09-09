@@ -1,7 +1,8 @@
 """Topology-petal TFG layout and SVG renderer.
 
-The renderer uses persisted production artifacts. Arbitrage detection is never
-used to place nodes.
+The renderer uses edge-disjoint undirected lobes from persisted production
+artifacts. Transfer arrows keep their real direction, and arbitrage detection
+is never used to place nodes.
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ from utils.analysis_paths import analysis_directory
 NODE_RE = re.compile(r'^\s*"([^"]+)"\s+\[(.*)\]\s*$')
 EDGE_RE = re.compile(r'^\s*"([^"]+)"\s*->\s*"([^"]+)"\s+\[(.*)\]\s*$')
 ORDER_RE = re.compile(r"\((\d+)\)")
+APPROVE_ORDER_RE = re.compile(r"\[(\d+)\]")
+EDGE_ID_RE = re.compile(r'\bid="?tfg-edge-(\d+)"?')
 EDGE_LABEL_RE = re.compile(r"label=<(.*?)>\s+arrowsize=", re.IGNORECASE)
 SVG_NAMESPACE = "http://www.w3.org/2000/svg"
 XLINK_NAMESPACE = "http://www.w3.org/1999/xlink"
@@ -30,6 +33,15 @@ ET.register_namespace("", SVG_NAMESPACE)
 ET.register_namespace("xlink", XLINK_NAMESPACE)
 
 NODE_CLEARANCE_POINTS = 12.0
+
+
+def _dot_edge_order(attributes: str) -> int | None:
+    """Read the machine edge ID without coupling it to the visible label."""
+    edge_id_match = EDGE_ID_RE.search(attributes)
+    if edge_id_match:
+        return int(edge_id_match.group(1))
+    order_match = ORDER_RE.search(attributes)
+    return int(order_match.group(1)) if order_match else None
 
 
 # Artifact loading and DOT parsing
@@ -49,11 +61,10 @@ def _parse_dot(dot_source: str) -> tuple[list[str], list[dict[str, Any]]]:
     for line in dot_source.splitlines():
         edge_match = EDGE_RE.match(line)
         if edge_match:
-            order_match = ORDER_RE.search(edge_match.group(3))
             edges.append({
                 "source": edge_match.group(1),
                 "target": edge_match.group(2),
-                "order": int(order_match.group(1)) if order_match else None,
+                "order": _dot_edge_order(edge_match.group(3)),
                 "line": line,
             })
             continue
@@ -64,7 +75,7 @@ def _parse_dot(dot_source: str) -> tuple[list[str], list[dict[str, Any]]]:
 
 
 def filter_dot_through_order(dot_source: str, max_order: int) -> str:
-    """Keep the complete TFG execution prefix through ``max_order``."""
+    """Keep a transfer prefix while retaining approvals as layout context."""
     if max_order < 0:
         raise ValueError("max_order must be non-negative")
 
@@ -74,8 +85,9 @@ def filter_dot_through_order(dot_source: str, max_order: int) -> str:
         edge_match = EDGE_RE.match(line)
         if not edge_match:
             continue
-        order_match = ORDER_RE.search(edge_match.group(3))
-        if order_match and int(order_match.group(1)) <= max_order:
+        edge_order = _dot_edge_order(edge_match.group(3))
+        is_approval = re.search(r'\bclass="?approve-edge"?', edge_match.group(3))
+        if is_approval or (edge_order is not None and edge_order <= max_order):
             retained_nodes.update((edge_match.group(1), edge_match.group(2)))
             retained_edge_lines.add(line)
 
@@ -94,6 +106,51 @@ def filter_dot_through_order(dot_source: str, max_order: int) -> str:
             continue
         output.append(line)
     return "\n".join(output) + "\n"
+
+
+def filter_dot_by_orders(dot_source: str, edge_orders: set[int]) -> str:
+    """Keep exactly the currently visible TFG edges and their incident nodes."""
+    if not edge_orders:
+        raise ValueError("At least one visible TFG edge is required")
+
+    retained_nodes: set[str] = set()
+    retained_edge_lines: set[str] = set()
+    for line in dot_source.splitlines():
+        edge_match = EDGE_RE.match(line)
+        if not edge_match:
+            continue
+        edge_order = _dot_edge_order(edge_match.group(3))
+        if edge_order is not None and edge_order in edge_orders:
+            retained_nodes.update((edge_match.group(1), edge_match.group(2)))
+            retained_edge_lines.add(line)
+
+    if not retained_edge_lines:
+        raise ValueError("No matching visible TFG edges were found")
+
+    output: list[str] = []
+    for line in dot_source.splitlines():
+        edge_match = EDGE_RE.match(line)
+        if edge_match:
+            if line in retained_edge_lines:
+                output.append(line)
+            continue
+        node_match = NODE_RE.match(line)
+        if node_match and node_match.group(1) not in retained_nodes:
+            continue
+        output.append(line)
+    return "\n".join(output) + "\n"
+
+
+def filter_dot_without_approvals(dot_source: str) -> str:
+    """Return the original transfer/mint/burn graph used for initial layout."""
+    edge_orders = {
+        edge_order
+        for line in dot_source.splitlines()
+        if (edge_match := EDGE_RE.match(line))
+        if not re.search(r'\bclass="?approve-edge"?', edge_match.group(3))
+        if (edge_order := _dot_edge_order(edge_match.group(3))) is not None
+    }
+    return filter_dot_by_orders(dot_source, edge_orders)
 
 
 def topology_center(dot_source: str, call_tree_path: Path | None = None) -> str:
@@ -120,23 +177,33 @@ def _cycle_from_edge(
     start_index: int,
     edges: list[dict[str, Any]],
     center: str,
-    unavailable: set[int],
-) -> list[int] | None:
-    """Find the shortest simple directed return path for one center edge."""
-    start = edges[start_index]
-    if start["source"] != center:
-        return None
-    if start["target"] == center:
-        return [start_index]
+    used: set[int],
+) -> tuple[list[int], list[str]] | None:
+    """Find one edge-disjoint undirected lobe returning to ``center``.
 
-    outgoing: defaultdict[str, list[int]] = defaultdict(list)
+    This is visual topology only. Transfer arrows retain their real direction,
+    while an edge may be traversed backwards to close a geometric lobe.
+    """
+    start = edges[start_index]
+    if center not in (start["source"], start["target"]):
+        return None
+    start_target = (
+        start["target"] if start["source"] == center else start["source"]
+    )
+    if start_target == center:
+        return [start_index], [center, center]
+
+    incident: defaultdict[str, list[int]] = defaultdict(list)
     for index, edge in enumerate(edges):
-        if index not in unavailable and index != start_index:
-            outgoing[edge["source"]].append(index)
-    for candidates in outgoing.values():
+        if index == start_index or index in used:
+            continue
+        incident[edge["source"]].append(index)
+        if edge["target"] != edge["source"]:
+            incident[edge["target"]].append(index)
+    for candidates in incident.values():
         candidates.sort(key=lambda index: edges[index]["order"] or 10**12)
 
-    best: list[int] | None = None
+    best: tuple[list[int], list[str]] | None = None
 
     def path_score(indexes: list[int]) -> tuple[Any, ...]:
         orders = [edges[index]["order"] or 10**12 for index in indexes]
@@ -147,23 +214,39 @@ def _cycle_from_edge(
             orders,
         )
 
-    def visit(node: str, path: list[int], visited_nodes: set[str]) -> None:
+    def visit(
+        node: str,
+        path: list[int],
+        path_nodes: list[str],
+        visited_nodes: set[str],
+    ) -> None:
         nonlocal best
-        if best is not None and len(path) >= len(best):
+        if best is not None and len(path) >= len(best[0]):
             return
-        for edge_index in outgoing.get(node, []):
+        for edge_index in incident.get(node, []):
             edge = edges[edge_index]
-            target = edge["target"]
+            target = edge["target"] if edge["source"] == node else edge["source"]
             candidate = [*path, edge_index]
+            candidate_nodes = [*path_nodes, target]
             if target == center:
-                if best is None or path_score(candidate) < path_score(best):
-                    best = candidate
+                if best is None or path_score(candidate) < path_score(best[0]):
+                    best = candidate, candidate_nodes
                 continue
             if target in visited_nodes:
                 continue
-            visit(target, candidate, visited_nodes | {target})
+            visit(
+                target,
+                candidate,
+                candidate_nodes,
+                visited_nodes | {target},
+            )
 
-    visit(start["target"], [start_index], {center, start["target"]})
+    visit(
+        start_target,
+        [start_index],
+        [center, start_target],
+        {center, start_target},
+    )
     return best
 
 
@@ -200,33 +283,48 @@ def _cycle_structures(
     distances: dict[str, int],
     parents: dict[str, str | None],
 ) -> tuple[list[dict[str, Any]], set[int]]:
-    """Find local directed cycles from the root outward."""
+    """Find edge-disjoint geometric lobes from the root outward."""
     used: set[int] = set()
     structures: list[dict[str, Any]] = []
 
     # Root first, then every node reached along a chain. This is the recursive
     # step that discovers a scheduler-local ring hanging below contract_to.
     for local_center in sorted(nodes, key=lambda node: (distances.get(node, 10**12), node)):
-        outgoing = sorted(
-            (index for index, edge in enumerate(edges) if edge["source"] == local_center),
+        incident = sorted(
+            (
+                index for index, edge in enumerate(edges)
+                if local_center in (edge["source"], edge["target"])
+            ),
             key=lambda index: edges[index]["order"] or 10**12,
         )
-        for edge_index in outgoing:
+        for edge_index in incident:
             if edge_index in used:
                 continue
-            cycle_indexes = _cycle_from_edge(edge_index, edges, local_center, used)
-            if not cycle_indexes:
+            cycle = _cycle_from_edge(edge_index, edges, local_center, used)
+            if not cycle:
                 continue
+            cycle_indexes, cycle_nodes = cycle
             used.update(cycle_indexes)
             cycle_edges = [edges[index] for index in cycle_indexes]
+            directed_closed = all(
+                edge["source"] == source and edge["target"] == target
+                for edge, source, target in zip(
+                    cycle_edges, cycle_nodes, cycle_nodes[1:]
+                )
+            )
             structures.append({
                 "kind": "cycle",
+                "topology_basis": "undirected_edge_disjoint",
+                "directed_closed": directed_closed,
                 "center": local_center,
                 "parent": parents.get(local_center),
                 "depth": distances.get(local_center, 0),
                 "orders": [edge["order"] for edge in cycle_edges],
-                "nodes": [local_center, *[edge["target"] for edge in cycle_edges]],
-                "first_order": min(edge["order"] for edge in cycle_edges if edge["order"] is not None),
+                "nodes": cycle_nodes,
+                "first_order": min(
+                    edges[index]["order"] for index in cycle_indexes
+                    if edges[index]["order"] is not None
+                ),
             })
     return structures, used
 
@@ -384,25 +482,81 @@ def _layout_structure_groups(
     structures: list[dict[str, Any]],
     center: str,
 ) -> tuple[list[dict[str, Any]], defaultdict[str, list[dict[str, Any]]]]:
-    """Split root petals from cycle petals nested below another node."""
-    root_structures = [
+    """Split and compact the structures that reserve geometric petal space."""
+    root_candidates = [
         structure for structure in structures
         if structure["kind"] == "chain" or structure.get("center", center) == center
     ]
+    root_structures = _space_reserving_structures(root_candidates, center)
     nested_by_center: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
     for structure in structures:
         if structure["kind"] == "cycle" and structure.get("center", center) != center:
             nested_by_center[structure["center"]].append(structure)
+    for local_center, local_cycles in list(nested_by_center.items()):
+        nested_by_center[local_center] = _space_reserving_structures(
+            local_cycles, local_center
+        )
     return root_structures, nested_by_center
+
+
+def _topology_path_signature(
+    structure: dict[str, Any],
+    local_center: str,
+) -> tuple[str, ...]:
+    """Return the center-anchored traversal used for geometric grouping."""
+    nodes = list(structure.get("nodes", []))
+    if nodes and nodes[0] != local_center and local_center in nodes:
+        center_index = nodes.index(local_center)
+        nodes = nodes[center_index:] + nodes[1:center_index + 1]
+    return tuple(nodes)
+
+
+def _space_reserving_structures(
+    structures: list[dict[str, Any]],
+    local_center: str,
+) -> list[dict[str, Any]]:
+    """Keep one spatial representative per geometric topology path.
+
+    Repeated executions of the same geometric path become parallel curve lanes
+    in one channel. A path whose non-center nodes are already a subset of a
+    larger, different path also needs no additional angular sector: it can use
+    the positions reserved by that larger structure.
+    """
+    representatives: list[dict[str, Any]] = []
+    seen_signatures: set[tuple[str, ...]] = set()
+    for structure in structures:
+        signature = _topology_path_signature(structure, local_center)
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        representatives.append(structure)
+
+    node_sets = [
+        set(structure.get("nodes", [])) - {local_center}
+        for structure in representatives
+    ]
+    return [
+        structure
+        for index, structure in enumerate(representatives)
+        if node_sets[index]
+        and not any(
+            node_sets[index] < other_nodes
+            for other_index, other_nodes in enumerate(node_sets)
+            if other_index != index
+        )
+    ]
 
 
 def _direction_slots(
     petals: list[dict[str, Any]],
     local_center: str,
 ) -> tuple[list[int], int]:
-    """Give petals sharing a real node one stable radial direction."""
+    """Share a direction only when the complete topology path is identical."""
     parents = list(range(len(petals)))
-    petal_nodes = [set(structure["nodes"]) - {local_center} for structure in petals]
+    signatures = [
+        _topology_path_signature(structure, local_center)
+        for structure in petals
+    ]
 
     def find(index: int) -> int:
         while parents[index] != index:
@@ -417,7 +571,7 @@ def _direction_slots(
 
     for first in range(len(petals)):
         for second in range(first):
-            if petal_nodes[first] & petal_nodes[second]:
+            if signatures[first] == signatures[second]:
                 union(second, first)
 
     roots = [find(index) for index in range(len(petals))]
@@ -541,14 +695,95 @@ def _root_position_proposals(
 def _average_position_proposals(
     proposed: defaultdict[str, list[tuple[float, float]]],
 ) -> dict[str, tuple[float, float]]:
-    """Merge positions for real nodes shared by multiple root petals."""
-    return {
-        node: (
+    """Merge shared nodes at an outer junction between their root petals."""
+    positions: dict[str, tuple[float, float]] = {}
+    for node, values in proposed.items():
+        average = (
             sum(value[0] for value in values) / len(values),
             sum(value[1] for value in values) / len(values),
         )
-        for node, values in proposed.items()
-    }
+        if len(values) == 1:
+            positions[node] = average
+            continue
+
+        # Distinct paths sharing this real node should meet at a visible outer
+        # junction. A plain average can collapse that junction onto one path's
+        # exclusive node when the petal angles are adjacent.
+        direction = average
+        direction_length = math.hypot(*direction)
+        if direction_length < 1e-9:
+            # Symmetric petals can cancel to the exact center. Use the first
+            # execution-stable proposal as a deterministic outer direction.
+            direction = values[0]
+            direction_length = max(math.hypot(*direction), 1.0)
+        junction_radius = max(math.hypot(*value) for value in values) + 80.0
+        positions[node] = (
+            direction[0] / direction_length * junction_radius,
+            direction[1] / direction_length * junction_radius,
+        )
+    return positions
+
+
+def _place_edge_disjoint_lobes_across_chords(
+    positions: dict[str, tuple[float, float]],
+    structures: list[dict[str, Any]],
+    center: str,
+) -> None:
+    """Put edge-disjoint lobes sharing two endpoints on opposite chord sides."""
+    cycles = [structure for structure in structures if structure["kind"] == "cycle"]
+    chord_groups: defaultdict[str, set[int]] = defaultdict(set)
+    for first_index, first in enumerate(cycles):
+        first_nodes = set(first["nodes"]) - {center}
+        for second_index in range(first_index):
+            second = cycles[second_index]
+            common_nodes = first_nodes & (set(second["nodes"]) - {center})
+            if not common_nodes:
+                continue
+            # The first shared node reached from the center is the stable
+            # endpoint of the visual chord between the two lobes.
+            join = min(
+                common_nodes,
+                key=lambda node: (
+                    max(first["nodes"].index(node), second["nodes"].index(node)),
+                    node,
+                ),
+            )
+            chord_groups[join].update((second_index, first_index))
+
+    center_x, center_y = positions[center]
+    for join, cycle_indexes in chord_groups.items():
+        if join not in positions:
+            continue
+        join_x, join_y = positions[join]
+        chord_x, chord_y = join_x - center_x, join_y - center_y
+        chord_length = math.hypot(chord_x, chord_y)
+        if chord_length < 1.0:
+            continue
+        perpendicular = (-chord_y / chord_length, chord_x / chord_length)
+        ordered_indexes = sorted(
+            cycle_indexes,
+            key=lambda index: cycles[index]["first_order"],
+        )
+        for branch_index, cycle_index in enumerate(ordered_indexes):
+            structure = cycles[cycle_index]
+            branch_nodes = list(dict.fromkeys(
+                node for node in structure["nodes"]
+                if node not in {center, join}
+            ))
+            if not branch_nodes:
+                continue
+            side = 1.0 if branch_index % 2 == 0 else -1.0
+            layer = branch_index // 2
+            lobe_height = max(185.0, chord_length * 0.42) * (1.0 + 0.5 * layer)
+            for node_index, node in enumerate(branch_nodes, start=1):
+                fraction = node_index / (len(branch_nodes) + 1)
+                bow = math.sin(math.pi * fraction)
+                positions[node] = (
+                    center_x + chord_x * fraction
+                    + perpendicular[0] * side * lobe_height * bow,
+                    center_y + chord_y * fraction
+                    + perpendicular[1] * side * lobe_height * bow,
+                )
 
 
 def _place_nested_flowers(
@@ -662,6 +897,9 @@ def topology_positions(
         center, root_structures, nested_by_center, extent_cache
     )
     positions = _average_position_proposals(proposed)
+    _place_edge_disjoint_lobes_across_chords(
+        positions, root_structures, center
+    )
     _place_nested_flowers(positions, nested_by_center, extent_cache)
     _place_unpositioned_nodes(nodes, positions)
     return positions
@@ -1080,13 +1318,27 @@ def _edge_topology_identity(
     """Read an SVG edge identity and attach stable topology attributes."""
     title = edge_group.find(_svg_tag("title"))
     edge_key = title.text if title is not None and title.text else ""
+    class_tokens = set(edge_group.get("class", "").split())
+    if "approve-edge" in class_tokens:
+        edge_group.set("data-edge-kind", "approve")
+    elif "mint-burn-edge" in class_tokens:
+        edge_group.set("data-edge-kind", "mint-burn")
+    else:
+        edge_group.set("data-edge-kind", "transfer")
     edge_text = " ".join(
         text.text or "" for text in edge_group.findall(_svg_tag("text"))
     )
+    edge_id_match = re.fullmatch(r"tfg-edge-(\d+)", edge_group.get("id", ""))
     order_match = ORDER_RE.search(edge_text)
+    edge_order = (
+        int(edge_id_match.group(1))
+        if edge_id_match else int(order_match.group(1)) if order_match else None
+    )
+    approve_order_match = APPROVE_ORDER_RE.search(edge_text)
+    if "approve-edge" in class_tokens and approve_order_match:
+        edge_group.set("data-approve-order", approve_order_match.group(1))
     petal_index: int | None = None
-    if order_match and int(order_match.group(1)) in order_structure:
-        edge_order = int(order_match.group(1))
+    if edge_order is not None and edge_order in order_structure:
         petal_index, structure_kind = order_structure[edge_order]
         edge_group.set("data-edge-order", str(edge_order))
         edge_group.set("data-petal-index", str(petal_index))
@@ -1462,7 +1714,9 @@ def enhance_svg_curves(svg: bytes, topology: dict[str, Any] | None = None) -> by
         root, topology, node_geometries
     )
 
-    for edge_group in root.findall(f".//{_svg_tag('g')}[@class='edge']"):
+    for edge_group in root.findall(f".//{_svg_tag('g')}"):
+        if "edge" not in edge_group.get("class", "").split():
+            continue
         label_item, samples = _curve_edge_group(
             edge_group,
             directed_indexes,
@@ -1482,14 +1736,29 @@ def enhance_svg_curves(svg: bytes, topology: dict[str, Any] | None = None) -> by
 # Public rendering entry point
 
 
-def render_tfg_svg(tx_hash: str, max_order: int | None = None) -> bytes:
+def render_tfg_svg(
+    tx_hash: str,
+    max_order: int | None = None,
+    edge_orders: set[int] | None = None,
+    include_approvals: bool = True,
+) -> bytes:
     dot_path, call_tree_path = _artifact_paths(tx_hash)
     if not dot_path.is_file():
         raise HTTPException(status_code=404, detail="Run transaction analysis first")
     dot_source = dot_path.read_text(encoding="utf-8")
-    if max_order is not None:
+    if edge_orders is not None:
+        try:
+            dot_source = filter_dot_by_orders(dot_source, edge_orders)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif max_order is not None:
         try:
             dot_source = filter_dot_through_order(dot_source, max_order)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif not include_approvals:
+        try:
+            dot_source = filter_dot_without_approvals(dot_source)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     center = topology_center(dot_source, call_tree_path)

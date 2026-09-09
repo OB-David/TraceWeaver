@@ -32,6 +32,7 @@ from labels.coordinator import (
 )
 from utils.tfg_cycles import TFG_CYCLE_SCHEMA_VERSION
 from utils.tfg_layout import render_tfg_svg
+from utils.extract_token_changes import LINK_ARTIFACT_SCHEMA_VERSION
 from utils.cfg_slice import build_cfg_subset_dot
 
 load_dotenv()
@@ -150,13 +151,23 @@ class CfgRelayoutRequest(BaseModel):
 
 
 class TfgRelayoutRequest(BaseModel):
-    max_order: int
+    max_order: int | None = None
+    edge_orders: list[int] | None = None
 
     @field_validator("max_order")
     @classmethod
-    def validate_max_order(cls, value: int) -> int:
-        if value < 0:
+    def validate_max_order(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
             raise ValueError("max_order must be non-negative")
+        return value
+
+    @field_validator("edge_orders")
+    @classmethod
+    def validate_edge_orders(cls, value: list[int] | None) -> list[int] | None:
+        if value is not None and (not value or len(value) > 20_000):
+            raise ValueError("edge_orders must contain between 1 and 20000 items")
+        if value is not None and any(order < 0 for order in value):
+            raise ValueError("edge_orders must be non-negative")
         return value
 
 class TransactionGasInfo(BaseModel):
@@ -242,6 +253,7 @@ def _completed_analysis_response(tx_hash: str) -> AnalyzeResponse | None:
     result_dir = _analysis_result_dir(tx_hash)
     required_files = {
         "analysis_timing.json",
+        "allowance_changes.json",
         "call_tree.json",
         "edge_id-step.json",
         "folded_blocks_information.json",
@@ -270,7 +282,7 @@ def _completed_analysis_response(tx_hash: str) -> AnalyzeResponse | None:
         return None
     edge_links = link_artifact.get("edge_links", {})
     if (
-        link_artifact.get("schema_version") != 1
+        link_artifact.get("schema_version") != LINK_ARTIFACT_SCHEMA_VERSION
         or not isinstance(edge_links, dict)
         or not all(isinstance(edge_links.get(name), list) for name in ("folded", "plain", "call_tree"))
     ):
@@ -618,12 +630,18 @@ async def relayout_folded_cfg(tx_hash: str, request: CfgRelayoutRequest):
 
 
 @app.get("/api/tfg/{tx_hash}.svg")
-async def render_token_flow_svg(tx_hash: str):
+async def render_token_flow_svg(tx_hash: str, include_approvals: bool = False):
     """Render the persisted TFG using the topology-petal layout."""
     if not TX_HASH_RE.match(tx_hash):
         raise HTTPException(status_code=400, detail="Invalid tx_hash format")
     try:
-        svg = await asyncio.to_thread(render_tfg_svg, tx_hash)
+        svg = await asyncio.to_thread(
+            render_tfg_svg,
+            tx_hash,
+            None,
+            None,
+            include_approvals,
+        )
     except subprocess.TimeoutExpired as exc:
         raise HTTPException(status_code=504, detail="TFG rendering timed out") from exc
     except HTTPException:
@@ -639,11 +657,17 @@ async def render_token_flow_svg(tx_hash: str):
 
 @app.post("/api/tfg/{tx_hash}/relayout.svg")
 async def relayout_token_flow_svg(tx_hash: str, request: TfgRelayoutRequest):
-    """Render the TFG playback prefix through one transfer order."""
+    """Relayout the currently visible TFG edges."""
     if not TX_HASH_RE.match(tx_hash):
         raise HTTPException(status_code=400, detail="Invalid tx_hash format")
     try:
-        svg = await asyncio.to_thread(render_tfg_svg, tx_hash, request.max_order)
+        edge_orders = set(request.edge_orders) if request.edge_orders is not None else None
+        svg = await asyncio.to_thread(
+            render_tfg_svg,
+            tx_hash,
+            request.max_order,
+            edge_orders,
+        )
     except HTTPException:
         raise
     except (OSError, subprocess.CalledProcessError) as exc:

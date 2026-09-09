@@ -25,6 +25,8 @@ from utils.extract_token_changes import (
     build_link_artifact,
     compute_address_balances,
     build_balance_timeline,
+    extract_allowance_changes,
+    build_approval_edges,
 )
 from utils.tfg_cycles import detect_tfg_cycles
 from utils.indentify_swap import filter_to_file
@@ -153,6 +155,7 @@ def run(tx_hash: str):
         standardized_trace = formatter.get_standardized_trace(tx_hash)
     contracts_addresses = standardized_trace.get("contracts_addresses", [])
     slot_map = standardized_trace.get("slot_map", {})
+    allowance_slot_map = standardized_trace.get("allowance_slot_map", {})
     users_addresses = standardized_trace.get("users_addresses", [])
     erc20_token_map = standardized_trace.get("erc20_token_map", {})
     full_address_name_map = standardized_trace.get("full_address_name_map", {})
@@ -168,7 +171,7 @@ def run(tx_hash: str):
 
     with timings.measure("construct_cfg_and_extract_changes"):
         plain_cfg, folded_cfg, original_cfg, all_changes, folded_node_map, _ = cfg_constructor.construct_cfg(
-            standardized_trace, slot_map, erc20_token_map
+            standardized_trace, slot_map, erc20_token_map, allowance_slot_map
         )
 
     # 3. 资产流分析
@@ -176,17 +179,24 @@ def run(tx_hash: str):
 
     with timings.measure("pair_asset_transfers"):
         pairs, annotations, pending_erc20 = pair_transactions(original_transfer, all_changes, token_decimals_map)
+        allowance_changes = extract_allowance_changes(
+            standardized_trace["steps"],
+            allowance_slot_map,
+            erc20_token_map,
+            token_decimals_map,
+        )
+        approvals = build_approval_edges(pairs, pending_erc20, allowance_changes)
     with timings.measure("build_sequence_tree"):
         tree_data = build_refined_hierarchical_trace(
             standardized_trace["steps"],
             root_calldata=tx.get("input"),
         )
     with timings.measure("map_afg_to_folded_cfg"):
-        edge_link_fcfg = afg_to_fcfg(pairs, pending_erc20, folded_cfg)
+        edge_link_fcfg = afg_to_fcfg(pairs, pending_erc20, folded_cfg, approvals)
     with timings.measure("map_afg_to_plain_cfg"):
-        edge_link_pcfg = afg_to_pcfg(pairs, pending_erc20, plain_cfg)
+        edge_link_pcfg = afg_to_pcfg(pairs, pending_erc20, plain_cfg, approvals)
     with timings.measure("map_afg_to_call_tree"):
-        edge_link_call_tree = afg_to_call_tree(pairs, pending_erc20, tree_data)
+        edge_link_call_tree = afg_to_call_tree(pairs, pending_erc20, tree_data, approvals)
     with timings.measure("detect_tfg_cycles"):
         tfg_cycle_result = detect_tfg_cycles(pairs)
     with timings.measure("compute_address_balances"):
@@ -198,6 +208,9 @@ def run(tx_hash: str):
     with timings.measure("write_core_analysis_artifacts"):
         with open(os.path.join(result_dir, "balance_and_eth_changes.json"), "w", encoding="utf-8") as f:
             json.dump(all_changes, f, indent=2, ensure_ascii=False)
+
+        with open(os.path.join(result_dir, "allowance_changes.json"), "w", encoding="utf-8") as f:
+            json.dump(approvals, f, indent=2, ensure_ascii=False)
 
         with open(os.path.join(result_dir, "link.json"), "w", encoding="utf-8") as f:
             json.dump(
@@ -233,6 +246,7 @@ def run(tx_hash: str):
         pairs=pairs,
         annotations=annotations,
         pending_erc20=pending_erc20,
+        approvals=approvals,
         tree_data=tree_data,
         progress_callback=publish_graph_stage,
         timing_callback=timings.record,

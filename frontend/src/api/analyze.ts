@@ -40,7 +40,7 @@ export interface EdgeLinkEvidence {
 export interface EdgeLink {
   schema_version?: number
   edge_id: number
-  type: 'ETH_TRANSFER' | 'ERC20_TOKEN_TRANSFER' | 'ERC20_BALANCE_CHANGE'
+  type: 'ETH_TRANSFER' | 'ERC20_TOKEN_TRANSFER' | 'ERC20_BALANCE_CHANGE' | 'ERC20_ALLOWANCE_CHANGE'
   mapping_status?: EdgeLinkMappingStatus
   evidence?: EdgeLinkEvidence[]
   matched_blocks: BlockId | BlockId[] | {
@@ -169,12 +169,23 @@ export async function cancelAnalysis(txHash: string): Promise<CancelAnalysisResu
   return res.json()
 }
 
-export async function fetchTfgSvg(txHash: string): Promise<string> {
-  const res = await fetch(`${API_BASE}/api/tfg/${txHash}.svg`, { cache: 'no-store' })
+export async function fetchTfgSvg(txHash: string, includeApprovals = false): Promise<string> {
+  const query = includeApprovals ? '?include_approvals=true' : ''
+  const res = await fetch(`${API_BASE}/api/tfg/${txHash}.svg${query}`, { cache: 'no-store' })
   if (!res.ok) {
     throw new Error(`Failed to fetch TFG SVG: ${res.status}`)
   }
   return res.text()
+}
+
+export interface AllowanceChange {
+  order: number
+  approve_order: number
+  type: 'ERC20_ALLOWANCE_CHANGE'
+}
+
+export async function fetchAllowanceChanges(txHash: string): Promise<AllowanceChange[]> {
+  return fetchJsonFile<AllowanceChange[]>('allowance_changes.json', txHash)
 }
 
 export async function fetchCfgSvg(txHash: string): Promise<string> {
@@ -192,7 +203,7 @@ export interface LinkArtifact {
 
 export async function fetchEdgeLink(txHash: string, mode: CfgMode = 'folded'): Promise<EdgeLink[]> {
   const artifact = await fetchJsonFile<LinkArtifact>('link.json', txHash)
-  if (artifact.schema_version !== 1 || !Array.isArray(artifact.edge_links?.[mode])) {
+  if (artifact.schema_version !== 2 || !Array.isArray(artifact.edge_links?.[mode])) {
     throw new Error('Unsupported link.json schema')
   }
   return artifact.edge_links[mode]
@@ -200,7 +211,7 @@ export async function fetchEdgeLink(txHash: string, mode: CfgMode = 'folded'): P
 
 export async function fetchCallTreeEdgeLink(txHash: string): Promise<CallTreeEdgeLink[]> {
   const artifact = await fetchJsonFile<LinkArtifact>('link.json', txHash)
-  if (artifact.schema_version !== 1 || !Array.isArray(artifact.edge_links?.call_tree)) {
+  if (artifact.schema_version !== 2 || !Array.isArray(artifact.edge_links?.call_tree)) {
     throw new Error('Unsupported link.json call-tree mapping schema')
   }
   return artifact.edge_links.call_tree
@@ -273,6 +284,17 @@ export interface Erc20Event {
   balance: string
 }
 
+export interface ApprovementEvent {
+  tokenname: string
+  token_address?: string
+  decimals?: number
+  type: 'read approvement' | 'write approvement'
+  owner: string
+  spender: string
+  allowance_slot?: string
+  allowance: string
+}
+
 export interface EthEvent {
   type: string
   from: string
@@ -283,6 +305,7 @@ export interface EthEvent {
 export interface BlockAction {
   action_type: string
   erc20_events: Erc20Event[]
+  approvement_events?: ApprovementEvent[]
   send_eth: string
   eth_event: EthEvent | null
 }
@@ -385,18 +408,18 @@ export async function fetchFoldedCfgRelayout(
   return res.text()
 }
 
-export async function fetchTfgPlaybackRelayout(
+export async function fetchTfgRelayout(
   txHash: string,
-  maxOrder: number,
+  edgeOrders: number[],
 ): Promise<string> {
   const res = await fetch(`${API_BASE}/api/tfg/${txHash}/relayout.svg`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ max_order: maxOrder }),
+    body: JSON.stringify({ edge_orders: edgeOrders }),
     cache: 'no-store',
   })
   if (!res.ok) {
-    let detail = `Failed to relayout TFG playback prefix: ${res.status}`
+    let detail = `Failed to relayout visible TFG content: ${res.status}`
     try {
       const payload = await res.json()
       if (payload?.detail) detail = payload.detail
@@ -511,7 +534,7 @@ export interface SwapPatternResult {
 export async function fetchTfgCycleResult(txHash: string): Promise<TfgCycleResult> {
   const result = await fetchJsonFile<TfgCycleResult>('tfg_cycles.json', txHash)
   if (
-    result.schema_version !== 5
+    result.schema_version !== 7
     || !Array.isArray(result.atomic_cycles)
     || !Array.isArray(result.minimal_paths)
     || !Array.isArray(result.selected_paths)
