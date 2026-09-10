@@ -1,5 +1,13 @@
 # EVM Transaction Analyzer
 
+<p align="center">
+  <a href="./system_showcase.pdf">
+    <img src="./system_showcase.png" alt="TraceWeaver system showcase" width="100%">
+  </a>
+</p>
+
+<p align="center"><em>TraceWeaver system overview — click the image to open the PDF.</em></p>
+
 ```
 evm-transaction-analyzer/
 ├── backend/    Python (FastAPI) analysis server
@@ -146,13 +154,22 @@ jq . data_base/analysis/<tx-hash-without-0x>/analysis_timing.json
 
 | Module | Description |
 |--------|-------------|
-| `main.py` | Main analysis pipeline entry point |
-| `main_api.py` | CLI wrapper accepting tx_hash as argument |
-| `server.py` | FastAPI server wrapping the pipeline |
-| `utils/evm_information.py` | EVM trace fetching, contract bytecode retrieval |
-| `utils/basic_block.py` | Bytecode to basic block conversion |
-| `utils/cfg_transaction.py` | Transaction-level CFG construction |
-| `utils/extract_token_changes.py` | Token transfer pairing and asset flow |
-| `utils/render_cfg.py` | CFG DOT file rendering |
-| `utils/render_legend.py` | Legend generation (matplotlib) |
-| `utils/block_exploration.py` | Block gas data fetching |
+| `main.py` | Standalone pipeline and shared graph/artifact writers |
+| `main_api.py` | Transaction-hash CLI pipeline used by the API server |
+| `server.py` | FastAPI analysis jobs, artifact delivery, graph rendering, and block/arbitrage endpoints |
+| `utils/analysis_paths.py` | Canonical per-transaction analysis output paths |
+| `utils/evm_information.py` | Trace standardization, storage/token metadata extraction, and contract bytecode retrieval |
+| `utils/quicknode_trace.py` | QuickNode trace retrieval and normalization fallback |
+| `utils/basic_block.py` | EVM bytecode disassembly and basic-block construction |
+| `utils/cfg_structure.py` | Core CFG node, edge, and graph data structures |
+| `utils/cfg_transaction.py` | Plain, folded, and original transaction-level CFG construction |
+| `utils/render_cfg.py` | CFG Graphviz/DOT generation and visual styling |
+| `utils/cfg_slice.py` | Validated subgraph extraction for focused CFG rendering |
+| `utils/extract_token_changes.py` | Transfer pairing, mint/burn recovery, approvals, balances, TFG generation, and evidence links |
+| `utils/tfg_cycles.py` | Structural address/token-cycle candidate detection; it does not prove profitability or MEV intent |
+| `utils/tfg_layout.py` | Topology-aware TFG layout, filtering, relayout, and SVG rendering |
+| `utils/call_tree.py` | Hierarchical call-tree construction, signature lookup, and sequence artifacts |
+| `utils/indentify_swap.py` | Opcode-pattern hints used to highlight possible swap regions in CFGs |
+| `utils/block_exploration.py` | Block gas summaries, transaction details, and background prefetching |
+| `labels/` | Dune/Geth arbitrage-label ingestion, durable storage, and unified queries |
+| `signature/` | Local 4byte signature database storage, synchronization, and compaction |
