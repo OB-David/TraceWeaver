@@ -1,175 +1,91 @@
-# EVM Transaction Analyzer
+# TraceWeaver
+
+TraceWeaver is a visual analysis tool for investigating Ethereum arbitrage transactions, including reverted attempts and transactions involving unverified contracts. It reconstructs token flows from execution traces and links them to contract calls and control-flow graphs. This repository includes a Python analysis backend, a Vue web interface, and experiment scripts.
+
+## System overview
 
 <p align="center">
-  <a href="./system_showcase.pdf">
-    <img src="./system_showcase.png" alt="TraceWeaver system showcase" width="100%">
+  <a href="pics/system_showcase.pdf">
+    <img src="pics/system_showcase.png" alt="TraceWeaver interface showing block exploration, token flows, a contract call tree, and linked control-flow and instruction views" width="100%">
   </a>
 </p>
 
-<p align="center"><em>TraceWeaver system overview — click the image to open the PDF.</em></p>
+*Linked token-flow, call-tree, and control-flow views. Select a transfer to inspect the calls and instructions behind it.* 
 
-```
-evm-transaction-analyzer/
-├── backend/    Python (FastAPI) analysis server
-├── frontend/   Vue 3 + TypeScript visualization app
-└── README.md
-```
+## Trace Abstraction Algorithm
 
-- **Backend** — Fetches transaction traces from an Ethereum node, disassembles contract bytecode into basic blocks, constructs transaction-level CFGs, extracts token transfer flows, and serves results via a FastAPI server.
-- **Frontend** — Interactive dashboard using D3-Graphviz for CFG/AFG rendering and Plotly for block gas heatmap visualization.
+<p align="center">
+  <a href="pics/trace_abstraction.pdf">
+    <img src="pics/traceabstraction.png" alt="Three trace-abstraction paths recover executed control flow, nested contract calls, and ordered asset events from EVM opcodes" width="100%">
+  </a>
+</p>
 
-## Prerequisites
+*The backend converts opcode traces into control flow, nested calls, and ordered asset events.* 
 
-- [UV](https://docs.astral.sh/uv/) (Python package manager, v0.4+)
-- Python 3.12+
-- Node.js 18+
-- Access to a Geth JSON-RPC endpoint
+## Quick start
 
-## Using UV
+### Requirements
 
-UV is the Python package manager used by this project.
-
-### Python version management
-
-- `uv python list` — View available Python versions
-- `uv python install python3.x` — Install a Python version
-- `uv python uninstall python3.x` — Uninstall a Python version
-
-### Project dependency management
-
-- `uv add <package>` — Add a dependency (updates `pyproject.toml`)
-- `uv remove <package>` — Remove a dependency
-- `uv sync` — Install/sync all dependencies
-- `uv lock` — Create/update the lockfile
-- `uv run <command>` — Run a command in the project environment
-- `uv tree` — View the dependency tree
-
-## Setup
+- Python 3.12+ and `uv`.
+- Node.js 18+ and npm.
+- Graphviz installed with `dot` available on `PATH` for server-side graph rendering.
+- A Geth-compatible Ethereum JSON-RPC endpoint with `debug_traceTransaction` enabled and access to the historical state needed for the selected transactions.
 
 ### Backend
 
-```bash
-cd backend
-uv sync                    # Install Python dependencies
-cp .env.example .env       # Create environment config
-# Edit .env with your actual values
-```
-
-Environment variables (configured in `backend/.env`):
-
-| Variable | Description |
-|----------|-------------|
-| `GETH_API` | URL of the Geth JSON-RPC endpoint |
-| `QUICKNODE_RPC_URL` | Full QuickNode Ethereum RPC URL used for historical opcode traces |
-| `QUICKNODE_ENDPOINT_NAME` | Optional QuickNode endpoint subdomain when the URL is assembled from a token |
-| `QUICKNODE_API_KEY` | QuickNode endpoint token; a `QN_...` platform key alone is not an RPC URL |
-| `POSTGRESQL_HOST` | PostgreSQL server host |
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-```
-
-## Running
-
-### Start the backend server
+From the repository root:
 
 ```bash
 cd backend
+uv sync --locked
+cp .env.example .env
+```
+
+Set `GETH_API` in `backend/.env` to your RPC endpoint. For historical traces that require the QuickNode fallback, set `QUICKNODE_RPC_URL` to your full endpoint URL; replace the example value.
+
+Build the local function-signature database before the first analysis, then start the API:
+
+```bash
+uv run python signature/sync.py
 uv run uvicorn server:app --port 9008
 ```
 
-The API server starts at `http://localhost:9008`.
+The initial signature sync downloads the full dataset and may take time; interrupted builds can be resumed by running the command again. The API is available at `http://localhost:9008`, with interactive documentation at `http://localhost:9008/docs`.
 
-### Start the frontend dev server
+### Frontend
+
+In a second terminal, from the repository root:
 
 ```bash
 cd frontend
+npm ci
 npm run dev
 ```
 
-The frontend starts at `http://localhost:9006`.
+Open `http://localhost:9006`, enter a mined contract-call transaction hash, and select **Analyze**. The development server proxies `/api` requests to the backend. Top-level contract-creation transactions and plain ETH transfers are currently unsupported by the analysis entry point.
 
-The frontend uses same-origin `/api` requests. During development, Vite proxies
-these requests to `http://127.0.0.1:9008`. Set `VITE_API_BASE` when the API is
-hosted separately (for example, `VITE_API_BASE=https://api.example.com`).
+### Command-line analysis
 
-### Standalone analysis (no server)
+After backend setup, run the same transaction analysis without the web interface:
 
 ```bash
 cd backend
-uv run python main.py
+uv run python main_api.py <transaction-hash>
 ```
 
-Runs the analysis pipeline on the hardcoded transaction hash in `main.py` and saves results to `data_base/analysis/`.
+Outputs are written to `data_base/analysis/<tx-hash-without-0x>/` at the repository root, including graph files, JSON evidence links, and `analysis_timing.json`.
 
-### Build the local function-signature database
+## Experiments
 
-Sequence rendering reads function names only from a complete local SQLite
-mirror; it never calls 4byte.directory in the rendering path. Build or refresh
-the mirror before analyzing transactions:
+See [reference experiments](reference/README.md) for scripts and usage instructions:
 
-```bash
-cd backend
-uv run python signature/sync.py
-```
+- [ERC-20 transfer recovery](reference/transfer_edge_recovery/ERC20_EVENT_GROUND_TRUTH.md): evaluate reconstructed transfers against receipt events.
+- [Uniswap v4 hooks](reference/uniswap_v4_hooks/README_uniswap_v4_hooks.md): discover hooks and inspect their source availability and transactions.
 
-The command mirrors every API record, resumes an interrupted `.partial` build,
-and publishes `data_base/signatures/function_signatures.sqlite3` only after the
-local row count matches a stable source snapshot. The current 1.179-million-row
-compact snapshot occupies about 99 MiB.
+## Repository guide
 
-To migrate an existing schema-v1 database to the compact schema without
-downloading the dataset again:
-
-```bash
-cd backend
-uv run python signature/sync.py --compact-existing
-```
-
-### Inspect analysis performance
-
-Each API analysis writes `analysis_timing.json` beside its graph artifacts. It
-contains total wall time, per-phase durations, and artifact sizes, and is
-updated throughout the run so an interrupted analysis still leaves useful
-profiling data.
-
-```bash
-jq . data_base/analysis/<tx-hash-without-0x>/analysis_timing.json
-```
-
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/analyze` | Analyze a transaction by hash |
-| GET | `/api/files/{tx_hash}/{filename}` | Retrieve analysis output files (.dot, .json, .svg) |
-| POST | `/api/block` | Get block gas data for heatmap |
-| GET | `/api/blocks` | Get block-level gas summary (paginated) |
-| GET | `/api/transaction/{tx_hash}/block` | Get block number for a transaction |
-
-## Key Backend Modules
-
-| Module | Description |
-|--------|-------------|
-| `main.py` | Standalone pipeline and shared graph/artifact writers |
-| `main_api.py` | Transaction-hash CLI pipeline used by the API server |
-| `server.py` | FastAPI analysis jobs, artifact delivery, graph rendering, and block/arbitrage endpoints |
-| `utils/analysis_paths.py` | Canonical per-transaction analysis output paths |
-| `utils/evm_information.py` | Trace standardization, storage/token metadata extraction, and contract bytecode retrieval |
-| `utils/quicknode_trace.py` | QuickNode trace retrieval and normalization fallback |
-| `utils/basic_block.py` | EVM bytecode disassembly and basic-block construction |
-| `utils/cfg_structure.py` | Core CFG node, edge, and graph data structures |
-| `utils/cfg_transaction.py` | Plain, folded, and original transaction-level CFG construction |
-| `utils/render_cfg.py` | CFG Graphviz/DOT generation and visual styling |
-| `utils/cfg_slice.py` | Validated subgraph extraction for focused CFG rendering |
-| `utils/extract_token_changes.py` | Transfer pairing, mint/burn recovery, approvals, balances, TFG generation, and evidence links |
-| `utils/tfg_cycles.py` | Structural address/token-cycle candidate detection; it does not prove profitability or MEV intent |
-| `utils/tfg_layout.py` | Topology-aware TFG layout, filtering, relayout, and SVG rendering |
-| `utils/call_tree.py` | Hierarchical call-tree construction, signature lookup, and sequence artifacts |
-| `utils/indentify_swap.py` | Opcode-pattern hints used to highlight possible swap regions in CFGs |
-| `utils/block_exploration.py` | Block gas summaries, transaction details, and background prefetching |
-| `labels/` | Dune/Geth arbitrage-label ingestion, durable storage, and unified queries |
-| `signature/` | Local 4byte signature database storage, synchronization, and compaction |
+| Path                        | Contents                                                                               |
+| --------------------------- | -------------------------------------------------------------------------------------- |
+| [`backend/`](backend/)     | FastAPI service, trace analysis, graph construction, and local signature/label stores. |
+| [`frontend/`](frontend/)   | Vue 3 and TypeScript interface with linked graph views.                                |
+| [`reference/`](reference/) | Experiment scripts and evaluation instructions.                                        |
