@@ -1,6 +1,6 @@
 # TraceWeaver
 
-TraceWeaver is a visual analysis tool for investigating Ethereum arbitrage transactions, including reverted attempts and transactions involving unverified contracts. It reconstructs token flows from execution traces and links them to contract calls and control-flow graphs. This repository includes a Python analysis backend, a Vue web interface, and experiment scripts.
+TraceWeaver is a visual analysis tool for investigating Ethereum arbitrage transactions, including reverted attempts and transactions involving unverified contracts. It reconstructs token flows from execution traces and links them to contract calls and control-flow graphs. This repository includes a Python analysis backend, a Vue web interface.
 
 ## System overview
 
@@ -10,7 +10,7 @@ TraceWeaver is a visual analysis tool for investigating Ethereum arbitrage trans
   </a>
 </p>
 
-*Linked token-flow, call-tree, and control-flow views. Select a transfer to inspect the calls and instructions behind it.* 
+*Linked token-flow, call-tree, and control-flow views. Select a transfer to inspect the calls and instructions behind it.*
 
 ## Trace Abstraction Algorithm
 
@@ -20,7 +20,7 @@ TraceWeaver is a visual analysis tool for investigating Ethereum arbitrage trans
   </a>
 </p>
 
-*The backend converts opcode traces into control flow, nested calls, and ordered asset events.* 
+*The backend converts opcode traces into control flow, nested calls, and ordered asset events.*
 
 ## Quick start
 
@@ -75,17 +75,9 @@ uv run python main_api.py <transaction-hash>
 
 Outputs are written to `data_base/analysis/<tx-hash-without-0x>/` at the repository root, including graph files, JSON evidence links, and `analysis_timing.json`.
 
-## Experiments
-
-See [reference experiments](reference/README.md) for scripts and usage instructions:
-
-- [ERC-20 transfer recovery](reference/transfer_edge_recovery/ERC20_EVENT_GROUND_TRUTH.md): evaluate reconstructed transfers against receipt events.
-- [Uniswap v4 hooks](reference/uniswap_v4_hooks/README_uniswap_v4_hooks.md): discover hooks and inspect their source availability and transactions.
-
 ## Repository guide
 
-| Path                        | Contents                                                                               |
-| --------------------------- | -------------------------------------------------------------------------------------- |
-| [`backend/`](backend/)     | FastAPI service, trace analysis, graph construction, and local signature/label stores. |
-| [`frontend/`](frontend/)   | Vue 3 and TypeScript interface with linked graph views.                                |
-| [`reference/`](reference/) | Experiment scripts and evaluation instructions.                                        |
+| Path                      | Contents                                                                               |
+| ------------------------- | -------------------------------------------------------------------------------------- |
+| [`backend/`](backend/)   | FastAPI service, trace analysis, graph construction, and local signature/label stores. |
+| [`frontend/`](frontend/) | Vue 3 and TypeScript interface with linked graph views.                                |
