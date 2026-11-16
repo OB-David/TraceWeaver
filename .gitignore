@@ -32,3 +32,4 @@ htmlcov/
 /llm_draft/
 /backend/tests/
 /server_address.txt/
+/deploy/
